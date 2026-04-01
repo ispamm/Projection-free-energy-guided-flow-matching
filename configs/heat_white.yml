@@ -35,8 +35,7 @@ datasets:
     n_data: 1000
 
 model:
-  kernel: matern
-  kernel_length: 0.2
+  kernel_length: 0.001
   kernel_variance: 1.
 encoder:
   type: fno

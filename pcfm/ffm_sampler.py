@@ -34,6 +34,55 @@ class FFM_sampler:
             )
             u = u + dt * v_proj
         return u.detach()
+    
+    def proflow_sample(self, u0, n_step, hfunc, K=3, lr_base=0.1):
+        """
+        PROFlow: Zero-Shot Physics-Consistent Sampling (Yu et al., 2026)
+        Implementation following Appendix C.
+        """
+        dt = 1.0 / n_step
+        u = u0.clone()
+        ts = torch.linspace(0, 1, n_step + 1, device=u0.device)
+        
+        # Add fresh noise
+        grid = make_grid(u.shape[-2:], u.device)
+
+        for t in tqdm(ts[:-1], desc="PROFlow sampling"):
+            # 1. Velocity Field evaluation
+            vf = self.model(t, u)
+            
+            # 2. Prediction of the terminal field u_1_hat (Forward Shooting)
+            # Given that u_t = (1-t)u_0 + t*u_1, then u_1 = u_t + (1-t)*v_t
+            u_1_hat = u + (1 - t) * vf
+            
+            # 3. PROXIMAL UPDATES with learning rate scheduler
+            # The paper states that lr scales with (1-t)
+            lr_t = lr_base * (1.0 - t.item())
+            
+            u_1_refined = u_1_hat.detach().requires_grad_(True)
+            for _ in range(K):  
+                residual = hfunc(u_1_refined)
+                loss = (residual ** 2).sum()
+                
+                grad = torch.autograd.grad(loss, u_1_refined)[0]
+                
+                # Proximal update
+                u_1_refined = u_1_refined.detach() - lr_t * grad
+                u_1_refined = u_1_refined.requires_grad_(True)
+            
+            u_1_refined = u_1_refined.detach()
+
+            # 4. RE-INTERPOLATION 
+            # u_t' = (1-t')*epsilon + t'*u_1_refined
+            t_next = t + dt
+            if t_next < 1.0:
+                # The paper specifies 'fresh noise epsilon ~ N(0,I)'
+                epsilon = self.gp.sample(grid, u.shape[-2:], n_samples=u.shape[0])
+                u = (1 - t_next) * epsilon + t_next * u_1_refined
+            else:
+                u = u_1_refined
+
+        return u.detach()
 
     @torch.no_grad()
     def vanilla_sample(self, u0, n_step):
@@ -46,6 +95,28 @@ class FFM_sampler:
             vf = self.model(t, u)
             u = u + dt * vf
         return u.detach()
+    
+    def continuous_guided_sample(self, u0, n_step, hfunc, gamma_max=10.0):
+        """
+        Current state continuous Gradient Flow with Parabolic Scheduling
+        """
+        dt = 1.0 / n_step
+        u = u0.clone()
+        ts = torch.linspace(0, 1, n_step + 1, device=u0.device)
+        
+        energy_history = []
+
+        for t in tqdm(ts[:-1], desc="Continuous Guided Flow", leave=False):
+            gamma_t = gamma_max * (t.item() ** 2)  # Parabolic scheduling
+            u = u.detach().requires_grad_(True)
+            vf = self.model(t, u)
+            residual = hfunc(u)
+            energy = (residual ** 2).sum()
+            energy_history.append(energy.item())
+            grad_E = torch.autograd.grad(energy, u)[0]
+            u = u.detach() + dt * (vf.detach() - gamma_t * grad_E)
+
+        return u.detach(), energy_history
 
     @torch.no_grad()
     def eci_sample(self, u0, n_step, n_mix, resample_step, constraint):
