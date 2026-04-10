@@ -31,7 +31,7 @@ class GPPrior(gpytorch.models.ExactGP):
 
         if kernel is None or kernel.lower() == 'matern':
             eps = 1e-10  # Diagonal covariance jitter
-            nu = 0.5  # Smoothness parameter, in [0.5, 1.5, 2.5]
+            nu = getattr(self, 'nu', 0.5)  # Smoothness parameter, in [0.5, 1.5, 2.5]
 
             # Default settings for length/variance
             if lengthscale is None:
@@ -155,7 +155,8 @@ class FFM(nn.Module):
         grid = make_grid(dims, device)
         noise = self.gp.sample(grid, dims, n_samples=n_sample)
         ts = torch.linspace(0, 1, n_eval + 1, device=device)
-        xs = odeint(self.model, noise, ts, method='dopri5', rtol=rtol, atol=atol)
+        # Change method to 'dopri5' for better accuracy at the cost of speed; 'rk4' is faster (and more stable) but less accurate
+        xs = odeint(self.model, noise, ts, method='rk4', rtol=rtol, atol=atol)
         if return_traj:
             return xs.detach()
         return xs[-1].detach()

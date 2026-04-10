@@ -1,3 +1,4 @@
+import os
 import argparse
 import torch
 import time
@@ -7,6 +8,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scripts.training.utils import load_config
 from models import get_flow_model
+from models.constraints import DirichletCondition
 from pcfm.ffm_sampler import FFM_sampler
 from pcfm.pcfm_sampling import make_grid, fast_project_batched
 from pcfm.constraints import Residuals
@@ -23,21 +25,22 @@ except ImportError:
 def parse_args():
     parser = argparse.ArgumentParser(description="Generative PDE Benchmark & Ablation")
     
-    # Parametri di Sistema e Modello
-    parser.add_argument("--config_path", type=str, default="configs/heat_white.yml", help="Percorso del file config.yml")
-    parser.add_argument("--ckpt_path", type=str, default="logs/heat_white_test/latest.pt", help="Percorso del checkpoint (.pt)")
-    parser.add_argument("--device", type=str, default="cuda:1", help="GPU da usare (es. cuda:0)")
-    parser.add_argument("--seed", type=int, default=42, help="Seed per la generazione del rumore di test")
+    # System & Reproducibility
+    parser.add_argument("--config_path", type=str, default="configs/heat_white.yml", help="config.yml path for the experiment")
+    parser.add_argument("--ckpt_path", type=str, default="logs/heat_white_test/latest.pt", help="Checkpoint (.pt) path for the pretrained model")
+    parser.add_argument("--device", type=str, default="cuda:1", help="GPU (es. cuda:0)")
+    parser.add_argument("--seed", type=int, default=42, help="Generation seed for reproducibility")
     
-    # Parametri di Esperimento
+    # Experiment Settings
+    parser.add_argument("--run_name", type=str, default=None, help="Wandb run name")
     parser.add_argument("--models", nargs="+", default=["all"], 
-                        help="Baseline da testare: vanilla, pcfm, proflow, ours, all")
-    parser.add_argument("--n_steps", type=int, default=100, help="Step di discretizzazione del solutore ODE")
-    parser.add_argument("--n_samples", type=int, default=100, help="Dimensione del batch di test")
+                        help="Baseline to test: vanilla, pcfm, proflow, ours, all...")
+    parser.add_argument("--n_steps", type=int, default=100, help="Number of sampling steps for each method")
+    parser.add_argument("--n_samples", type=int, default=100, help="Number of samples to generate and compare")
     
-    # Parametri Ablation per "Ours"
+    # Ablation Parameters for "Ours"
     parser.add_argument("--gamma_list", nargs="+", type=float, default=[1.0], 
-                        help="Ablation: lista di gamma_max. Es: --gamma_list 0.1 1.0 2.0")
+                        help="Ablation for gamma values. Es: --gamma_list 0.1 1.0 2.0")
     
     return parser.parse_args()
 
@@ -46,9 +49,11 @@ def main():
     torch.manual_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
+    run_name = args.run_name if args.run_name else f"eval_{args.n_samples}s_{args.n_steps}step"
+    
     wandb.init(
         project="pcfm-physics-comparison", 
-        name=f"eval_{args.n_samples}s_{args.n_steps}step",
+        name=run_name,
         config=vars(args)
     )
 
@@ -78,8 +83,6 @@ def main():
         print(f"Cap down n_samples to {actual_samples} to avoid crashes.\n")
         args.n_samples = actual_samples
         
-        # Dobbiamo anche tagliare u0 per assicurarci che abbiano la stessa lunghezza!
-        u0 = u0[:actual_samples]
     
     if u_exact.dim() == 4:
         u_exact = u_exact.squeeze(1)
@@ -109,6 +112,15 @@ def main():
         for g in args.gamma_list:
             trackers[f"Ours_g{g}"] = MetricsTracker(f"Ours (gamma={g})")
 
+    if "all" in args.models or "eci" in args.models:
+        trackers["ECI"] = MetricsTracker("ECI")
+        
+    if "all" in args.models or "diffusionpde" in args.models:
+        trackers["DiffusionPDE"] = MetricsTracker("DiffusionPDE")
+        
+    if "all" in args.models or "dflow" in args.models:
+        trackers["DFlow"] = MetricsTracker("DFlow")
+
     print("4. Iterative Generation (to respect the original Residuals class)...")
     sampler = FFM_sampler(model, model.gp)
 
@@ -129,10 +141,63 @@ def main():
             x=x_grid, 
             t_grid=t_grid, 
             nx=dims[0], 
-            nt=dims[1]
+            nt=dims[1],
+            nu=0.005,
+            rho=0.01
         )
-        hfunc = physics_rules.full_residual_heat
+
+        hfunc = physics_rules.full_residual_rd
         
+        # 1. Boolean mask creation for the constrained points (t=0, x=0, x=L)
+        mask_bool = torch.zeros_like(u_exact_i, dtype=torch.bool)
+        mask_bool[:, :, 0] = True  # Condizione Iniziale (t=0)
+        #mask_bool[:, 0, :] = True  # Bordo sinistro (x=0)
+        #mask_bool[:, -1, :] = True # Bordo destro (x=L)
+        
+        # Float version of the mask for loss computations in guided methods
+        mask_float = mask_bool.float()
+        
+        # 2. Loss Function for guided methods (DiffusionPDE, DFlow, PROFlow)
+        def composite_loss_fn(u_pred, u_true, mask_tensor):
+            # Data term (IC/BC)
+            data_loss = ((u_pred - u_true) * mask_tensor).square().sum()
+            
+            # PINN term (Physics) weighted at 1e-2 as per the paper
+            # Calculate the residual and take its loss (MSE)
+            pinn_residual = hfunc(u_pred)
+            pinn_loss = (pinn_residual ** 2).sum() * 0.01
+            
+            return data_loss + pinn_loss
+
+        constraint = DirichletCondition(value=u_exact_i, mask=mask_bool)
+        
+        # 5. ECI (Exact Constraint Injection)
+        if "ECI" in trackers:
+            start_t = time.time()
+            u_eci = sampler.eci_sample(u0_i, args.n_steps, n_mix=5, resample_step=5, constraint=constraint)
+            res_eci = compute_physical_residual(u_eci, hfunc)
+            trackers["ECI"].record_step(u_eci, res_eci, start_t, time.time())
+
+        # 6. DiffusionPDE
+        if "DiffusionPDE" in trackers:
+            start_t = time.time()
+            u_diffpde = sampler.guided_sample(
+                u0_i, u_exact_i, mask_float, args.n_steps, 
+                loss_fn=composite_loss_fn, eta=0.01 
+            )
+            res_diffpde = compute_physical_residual(u_diffpde, hfunc)
+            trackers["DiffusionPDE"].record_step(u_diffpde, res_diffpde, start_t, time.time())
+
+        # 7. D-Flow
+        if "DFlow" in trackers:
+            start_t = time.time()
+            u_dflow = sampler.dflow_sample(
+                u_exact_i, mask_float, n_sample=1, n_step=args.n_steps, 
+                n_iter=20, lr=1, loss_fn=composite_loss_fn
+            )
+            res_dflow = compute_physical_residual(u_dflow, hfunc)
+            trackers["DFlow"].record_step(u_dflow, res_dflow, start_t, time.time())
+
         # 1. Vanilla FM
         if "Vanilla" in trackers:
             start_t = time.time()
@@ -154,7 +219,7 @@ def main():
             # Flow Matching con parametri Appendice H
             u_pcfm_i = sampler.pcfm_sample(
                 u0_i, args.n_steps, hfunc=hfunc, newtonsteps=1,
-                guided_interpolation=True,
+                guided_interpolation=False,
                 interpolation_params={'custom_lam': 1.0, 'step_size': 0.01, 'num_steps': 20}
             )
             # Final projection Float64
@@ -172,7 +237,7 @@ def main():
             tracker_key = f"Ours_g{g}"
             if tracker_key in trackers:    
                 start_t = time.time()
-                u_ours, _ = sampler.continuous_guided_sample(u0_i, args.n_steps, hfunc, gamma_max=g)
+                u_ours, _ = sampler.continuous_guided_sample(u0_i, args.n_steps, hfunc, gamma_max=g, final_refinement=True, refinement_steps=1, refinement_lr=0.2)
                 res_ours = compute_physical_residual(u_ours, hfunc)
                 trackers[tracker_key].record_step(u_ours, res_ours, start_t, time.time())
 
@@ -180,27 +245,52 @@ def main():
     # 5. Global metrics and Wnadb logging 
     print("\n6. Computing Distribution Metrics and Logging to Wandb...")
     wandb_log_dict = {}
-    columns = ["Method", "Speed (sec/sample)", "Physical Residual (MAE)", "MMSE", "SMSE", "SampleMSE"]
+    columns = ["Method", "Speed (sec/sample)", "Physical Residual (MAE)", "IC Error", "BC Error", "CL Error", "MMSE", "SMSE", "SampleMSE"]
     results_table = wandb.Table(columns=columns)
     
+    mask_bc = torch.zeros_like(u_exact_all, dtype=torch.bool)
+    mask_bc[:, 0, :] = True
+    mask_bc[:, -1, :] = True
+
     for name, tracker in trackers.items():
         tracker.print_summary()         
         # Retrieve all generated samples for this method (shape: [n_sample, nx, nt])
         u_pred_all = tracker.get_all_samples_tensor()
         
-        # COmpute distribution metrics (MMSE, SMSE) against the ground truth
+        ce_ic = torch.nn.functional.mse_loss(
+            u_pred_all[:, :, 0], 
+            u_exact_all[:, :, 0]
+        ).item()
+        
+        ce_bc = torch.nn.functional.mse_loss(
+            u_pred_all[mask_bc], 
+            u_exact_all[mask_bc]
+        ).item()
+
+        mass_t0 = u_pred_all[:, :, 0].mean(dim=1, keepdim=True) # [N, 1]
+        mass_all_t = u_pred_all.mean(dim=1)                     # [N, nt]
+        ce_cl = (mass_all_t - mass_t0).abs().mean().item()
+
+        # Compute distribution metrics (MMSE, SMSE) against the ground truth
         mmse, smse = compute_distribution_metrics(u_pred_all, u_exact_all)
         sample_mse = compute_samplewise_mse(u_pred_all, u_exact_all)
         speed = tracker.get_average_speed()
         residual = tracker.get_average_residual()
+
+        save_dir = f"results/{run_name}"
+        os.makedirs(save_dir, exist_ok=True)
+        torch.save(u_pred_all.cpu(), os.path.join(save_dir, f"{name}_tensors.pt"))
         
         # Populate the wandb log dict and results table
         wandb_log_dict[f"Speed (sec/sample)/{name}"] = speed
         wandb_log_dict[f"Physics_Error (MAE)/{name}"] = residual
+        wandb_log_dict[f"Physics_Error_IC/{name}"] = ce_ic
+        wandb_log_dict[f"Physics_Error_BC/{name}"] = ce_bc
+        wandb_log_dict[f"Physics_Error_CL/{name}"] = ce_cl
         wandb_log_dict[f"Distribution_MMSE/{name}"] = mmse
         wandb_log_dict[f"Distribution_SMSE/{name}"] = smse
         wandb_log_dict[f"Distribution_SampleMSE/{name}"] = sample_mse
-        results_table.add_data(name, speed, residual, mmse, smse, sample_mse)
+        results_table.add_data(name, speed, residual, ce_ic, ce_bc, ce_cl, mmse, smse, sample_mse)
 
     wandb_log_dict["Final_Results_Table"] = results_table
     wandb.log(wandb_log_dict)

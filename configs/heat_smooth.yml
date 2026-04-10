@@ -37,7 +37,7 @@ datasets:
 model:
   kernel: matern
   kernel_length: 0.2
-  kernel_variance: 1.
+  kernel_variance: 1.0
 encoder:
   type: fno
   n_modes: [ 32, 32 ]

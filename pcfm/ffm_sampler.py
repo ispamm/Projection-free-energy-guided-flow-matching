@@ -96,15 +96,15 @@ class FFM_sampler:
             u = u + dt * vf
         return u.detach()
     
-    def continuous_guided_sample(self, u0, n_step, hfunc, gamma_max=10.0):
+    def continuous_guided_sample(self, u0, n_step, hfunc, gamma_max=10.0, track_energy=False, final_refinement=False, refinement_steps=5, refinement_lr=1e-2):
         """
-        Current state continuous Gradient Flow with Parabolic Scheduling
+        Current state continuous Gradient Flow with Parabolic Scheduling and optional final physics refinement.
         """
         dt = 1.0 / n_step
         u = u0.clone()
         ts = torch.linspace(0, 1, n_step + 1, device=u0.device)
         
-        energy_history = []
+        energy_history = [] if track_energy else None
 
         for t in tqdm(ts[:-1], desc="Continuous Guided Flow", leave=False):
             gamma_t = gamma_max * (t.item() ** 2)  # Parabolic scheduling
@@ -112,9 +112,23 @@ class FFM_sampler:
             vf = self.model(t, u)
             residual = hfunc(u)
             energy = (residual ** 2).sum()
-            energy_history.append(energy.item())
+            
+            if track_energy:
+                energy_history.append(energy.item())
+
             grad_E = torch.autograd.grad(energy, u)[0]
             u = u.detach() + dt * (vf.detach() - gamma_t * grad_E)
+
+        if final_refinement:
+            u = u.detach().requires_grad_(True)
+            for _ in range(refinement_steps):
+                residual = hfunc(u)
+                energy = (residual ** 2).sum()
+                grad_E = torch.autograd.grad(energy, u)[0]
+                
+                # Simple gradient descent without vector field
+                u = u.detach() - refinement_lr * grad_E
+                u = u.requires_grad_(True)    
 
         return u.detach(), energy_history
 
@@ -190,7 +204,7 @@ class FFM_sampler:
         loss_fn = loss_fn or default_loss_fn
 
         def euler_ffm(u):
-            print("DFlow sampling...")
+            #print("DFlow sampling...")
             tspan = torch.tensor([0, 1.], device=device)
             u = odeint(self.model, u, tspan, method="euler", options = {"step_size":ts[1]-ts[0]})[-1]
             return u 
