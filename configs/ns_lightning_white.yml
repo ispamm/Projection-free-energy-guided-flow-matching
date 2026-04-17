@@ -42,7 +42,7 @@ encoder:
 
 n_sample: 2
 n_eval: 1
-sample_dims: [ 32, 32, 25 ]
+sample_dims: [ 64, 64, 50 ]
 vis:
   downsample: 1
   vmin: -2.5

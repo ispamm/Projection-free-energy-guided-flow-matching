@@ -30,7 +30,7 @@ class DiffusionDataset(Dataset):
         v = random.uniform(*self.visc_range)
         phi = random.uniform(*self.phi_range)
         u = torch.sin(self.xs + phi) * torch.exp(-self.ts * v)  # (nx, nt)
-        return u
+        return u, v
 
     def __len__(self):
         return self.n_data

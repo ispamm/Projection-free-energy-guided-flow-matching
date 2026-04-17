@@ -18,6 +18,33 @@ def compute_physical_residual(u_pred, hfunc):
         error = residual.abs().mean().item()
     return error
 
+def compute_ns_physical_residual(u_pred, f_i, nu=0.001, dx=1/64, dy=1/64, dt=1.0):
+    """
+    Calcola il residuo della PDE assicurandosi che tutti i tensori siano sullo stesso device.
+    """
+    with torch.no_grad():
+        
+        u = u_pred.squeeze()
+        if u.dim() == 4:
+            u = u[0]
+            
+        device = u.device 
+        u = u.to(torch.float64)
+        f = f_i.squeeze().to(device=device, dtype=torch.float64)
+        
+        if not (u.shape[0] == u.shape[1]):
+            u = u.permute(1, 2, 0)
+
+        u_t = (u[:, :, 1:] - u[:, :, :-1]) / dt
+        
+        u_xx = (u[2:, 1:-1, :-1] - 2*u[1:-1, 1:-1, :-1] + u[:-2, 1:-1, :-1]) / (dx**2)
+        u_yy = (u[1:-1, 2:, :-1] - 2*u[1:-1, 1:-1, :-1] + u[1:-1, :-2, :-1]) / (dy**2)
+        diffusion = nu * (u_xx + u_yy)
+        forcing = f[1:-1, 1:-1].unsqueeze(-1)
+        pde_res = u_t[1:-1, 1:-1, :] - diffusion - forcing
+        
+        return pde_res.abs().mean().item()
+
 def compute_speed(total_time_seconds, num_samples):
     """
     Compute the inference speed in seconds per sample (sec/sample).
@@ -90,6 +117,7 @@ class MetricsTracker:
     def get_average_residual(self):
         """Returns the average physical residual."""
         return np.mean(self.residuals)
+    
         
     def get_all_samples_tensor(self):
         """Concatenate all samples into a single large tensor [N_tot, N_x, N_t]."""

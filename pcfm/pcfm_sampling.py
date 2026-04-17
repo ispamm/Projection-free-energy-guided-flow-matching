@@ -30,7 +30,8 @@ def fast_project_batched(xi_batch: torch.Tensor, h_func: Callable[[torch.Tensor]
         delta = (xi - u).unsqueeze(-1)
         JJt = J @ J.transpose(-2, -1)
         rhs = J @ delta + h_val
-        lambda_ = torch.linalg.solve(JJt, rhs)
+        #lambda_ = torch.linalg.solve(JJt, rhs)
+        lambda_ = torch.linalg.lstsq(JJt, rhs).solution
         du = delta - J.transpose(-2, -1) @ lambda_
         return u + du.squeeze(-1)
 
