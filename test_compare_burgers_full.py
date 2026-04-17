@@ -11,6 +11,7 @@ from models import get_flow_model
 from models.constraints import DirichletCondition
 from pcfm.ffm_sampler import FFM_sampler
 from pcfm.pcfm_sampling import make_grid, fast_project_batched
+from pcfm.constraints import Residuals
 from metrics import compute_physical_residual, compute_speed, compute_distribution_metrics, compute_samplewise_mse, MetricsTracker
 from physics_engine import BurgersEquationResidualsFullPDE
 
@@ -259,7 +260,7 @@ def main():
             "mass": 0.0,
         }
 
-    def compute_component_errors(u_pred, u_true, physics_rules):
+    def compute_component_errors(u_pred, u_true, physics_rules, mass_rules):
         u_pred_flat = u_pred.flatten()
 
         ic_error = torch.nn.functional.mse_loss(u_pred[:, :, 0], u_true[:, :, 0]).item()
@@ -270,7 +271,7 @@ def main():
         bc_error = 0.5 * (bc_left_error + bc_right_error)
         pde_scaled_error = physics_rules.pde_residual_scaled(u_pred_flat).abs().mean().item()
         pde_raw_error = physics_rules.pde_residual(u_pred_flat).abs().mean().item()
-        mass_error = np.nan
+        mass_error = mass_rules.mass_residual_burgers(u_pred_flat)[1:].abs().mean().item()
 
         return {
             "ic": ic_error,
@@ -323,6 +324,15 @@ def main():
             spatial_domain=[0, 1],
             time_domain=[0, 1],
         )
+        mass_rules = Residuals(
+            data=u_exact_i,
+            x=x_grid,
+            t_grid=t_grid,
+            nx=dims[0],
+            nt=dims[1],
+            nu=nu_exact,
+            left_bc=u_exact_i[0, 0, 1:].mean(),
+        )
 
         hfunc = physics_rules
         eval_hfunc = hfunc
@@ -362,7 +372,7 @@ def main():
             res_eci = compute_physical_residual(u_eci, eval_hfunc)
             end_t = time.time()
             if not deactivate_if_nan("ECI", res_eci, i):
-                record_component_errors("ECI", compute_component_errors(u_eci, u_exact_i, physics_rules))
+                record_component_errors("ECI", compute_component_errors(u_eci, u_exact_i, physics_rules, mass_rules))
                 mark_success("ECI", u_eci, res_eci, start_t, end_t)
 
         # 6. DiffusionPDE
@@ -375,7 +385,7 @@ def main():
             res_diffpde = compute_physical_residual(u_diffpde, eval_hfunc)
             end_t = time.time()
             if not deactivate_if_nan("DiffusionPDE", res_diffpde, i):
-                record_component_errors("DiffusionPDE", compute_component_errors(u_diffpde, u_exact_i, physics_rules))
+                record_component_errors("DiffusionPDE", compute_component_errors(u_diffpde, u_exact_i, physics_rules, mass_rules))
                 mark_success("DiffusionPDE", u_diffpde, res_diffpde, start_t, end_t)
 
         # 7. D-Flow
@@ -388,7 +398,7 @@ def main():
             res_dflow = compute_physical_residual(u_dflow, eval_hfunc)
             end_t = time.time()
             if not deactivate_if_nan("DFlow", res_dflow, i):
-                record_component_errors("DFlow", compute_component_errors(u_dflow, u_exact_i, physics_rules))
+                record_component_errors("DFlow", compute_component_errors(u_dflow, u_exact_i, physics_rules, mass_rules))
                 mark_success("DFlow", u_dflow, res_dflow, start_t, end_t)
 
         # 1. Vanilla FM
@@ -398,7 +408,7 @@ def main():
             res_vanilla = compute_physical_residual(u_vanilla, eval_hfunc)
             end_t = time.time()
             if not deactivate_if_nan("Vanilla", res_vanilla, i):
-                record_component_errors("Vanilla", compute_component_errors(u_vanilla, u_exact_i, physics_rules))
+                record_component_errors("Vanilla", compute_component_errors(u_vanilla, u_exact_i, physics_rules, mass_rules))
                 mark_success("Vanilla", u_vanilla, res_vanilla, start_t, end_t)
 
 
@@ -409,7 +419,7 @@ def main():
             res_proflow = compute_physical_residual(u_proflow, eval_hfunc)
             end_t = time.time()
             if not deactivate_if_nan("PROFlow", res_proflow, i):
-                record_component_errors("PROFlow", compute_component_errors(u_proflow, u_exact_i, physics_rules))
+                record_component_errors("PROFlow", compute_component_errors(u_proflow, u_exact_i, physics_rules, mass_rules))
                 mark_success("PROFlow", u_proflow, res_proflow, start_t, end_t)
 
         # 4. Original PCFM with the Float64 final projection fix
@@ -430,7 +440,7 @@ def main():
             res_pcfm = compute_physical_residual(u_pcfm, hfunc)
             end_t = time.time()
             if not deactivate_if_nan("PCFM", res_pcfm, i):
-                record_component_errors("PCFM", compute_component_errors(u_pcfm, u_exact_i, physics_rules))
+                record_component_errors("PCFM", compute_component_errors(u_pcfm, u_exact_i, physics_rules, mass_rules))
                 mark_success("PCFM", u_pcfm, res_pcfm, start_t, end_t)
 
 
@@ -443,7 +453,7 @@ def main():
                 res_ours = compute_physical_residual(u_ours, hfunc)
                 end_t = time.time()
                 if not deactivate_if_nan(tracker_key, res_ours, i):
-                    record_component_errors(tracker_key, compute_component_errors(u_ours, u_exact_i, physics_rules))
+                    record_component_errors(tracker_key, compute_component_errors(u_ours, u_exact_i, physics_rules, mass_rules))
                     mark_success(tracker_key, u_ours, res_ours, start_t, end_t)
 
         if args.log_every > 0 and ((i + 1) % args.log_every == 0):

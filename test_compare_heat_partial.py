@@ -52,7 +52,7 @@ def main():
     torch.manual_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
-    run_name = args.run_name if args.run_name else f"eval_{args.n_samples}s_{args.n_steps}step"
+    run_name = args.run_name if args.run_name else f"eval_partial_{args.n_samples}s_{args.n_steps}step"
     
     wandb.init(
         project="pcfm-physics-comparison", 
@@ -62,6 +62,9 @@ def main():
 
     print(f"1. Loading configuration from {args.config_path}...")
     config = load_config(args.config_path)
+    cond_type = getattr(config, "cond_type", "ic")
+    if cond_type != "ic":
+        raise NotImplementedError(f"Unsupported cond_type for heat partial: {cond_type}")
     
     print(f"Loading model and weights from {args.ckpt_path} to {device}...")
     model = get_flow_model(config.model, config.encoder).to(device)
@@ -75,13 +78,14 @@ def main():
     print("2. Ground Truth Loading...")
     train_set, test_set = get_dataset(config.datasets)
     test_loader = DataLoader(test_set, batch_size=args.n_samples, shuffle=False)
-    batch = next(iter(test_loader))
     
     # 1. The batch is the real data (u_exact) we want to compare against
     batch = next(iter(test_loader))
     u_exact = batch[0]
     v_exact = batch[1].to(device)
     # if the tensor has an unnecessary 'channel' dimension (e.g., [3, 1, 100, 100]), we remove it
+    if u_exact.dim() == 4 and u_exact.shape[1] == 1:
+        u_exact = u_exact.squeeze(1)
     actual_samples = u_exact.shape[0]
     if actual_samples < args.n_samples:
         print(f"\n[WARNING] Asked for {args.n_samples} samples, but the test dataset has only {actual_samples}.")
@@ -89,16 +93,14 @@ def main():
         args.n_samples = actual_samples
         
     
-    if u_exact.dim() == 4:
-        u_exact = u_exact.squeeze(1)
     u_exact_all = u_exact.cpu()  # Keep a copy on CPU for later metric computations
         
     # 2. Build the spatial and temporal grids (x_grid, t_grid) based on the dimensions specified in the config
-    x_grid = torch.linspace(0, 1, dims[0], device=device)
+    x_grid = torch.linspace(0, 2 * np.pi, dims[0], device=device)
     t_grid = torch.linspace(0, 1, dims[1], device=device)
 
     print("3. Generation of initial noise (u0)...")
-    grid = make_grid(dims, device)
+    grid = make_grid(dims, device, start=(0.0, 0.0), end=(2 * np.pi, 1.0))
     u0 = model.gp.sample(grid, dims, n_samples=args.n_samples).to(device)
 
     print("4. Setup Trackers...")
@@ -106,6 +108,7 @@ def main():
     method_active = {}
     method_success_counts = {}
     method_failure_sample = {}
+    method_component_sums = {}
 
     def mark_success(name, sample, residual, start_t, end_t):
         """Record valid sample stats and keep the method active."""
@@ -140,7 +143,7 @@ def main():
             periodic_log[f"Periodic/Speed (sec/sample)/{name}"] = tracker.get_average_speed()
             periodic_log[f"Periodic/Physics_Error (MAE)/{name}"] = tracker.get_average_residual()
 
-        periodic_table = wandb.Table(columns=["Method", "Success Rate (%)", "Generated Samples", "Speed (sec/sample)", "Physical Residual (MAE)", "IC Error", "BC Error", "CL Error", "MMSE", "SMSE", "SampleMSE"])
+        periodic_table = wandb.Table(columns=["Method", "Success Rate (%)", "Generated Samples", "Speed (sec/sample)", "Physical Residual (MAE)", "IC Error", "BC Left Error", "BC Right Error", "BC Error", "PDE Error (Scaled)", "PDE Error (Raw)", "Mass Error", "CL Error", "MMSE", "SMSE", "SampleMSE"])
         for name, tracker in trackers.items():
             success_count = method_success_counts[name]
             success_rate = 100.0 * success_count / max(1, args.n_samples)
@@ -150,12 +153,14 @@ def main():
                 u_pred_all = tracker.get_all_samples_tensor()
                 u_exact_ref = u_exact_all
 
-                mask_bc = torch.zeros_like(u_exact_ref, dtype=torch.bool)
-                mask_bc[:, 0, :] = True
-                mask_bc[:, -1, :] = True
-
-                ce_ic = torch.nn.functional.mse_loss(u_pred_all[:, :, 0], u_exact_ref[:, :, 0]).item()
-                ce_bc = torch.nn.functional.mse_loss(u_pred_all[mask_bc], u_exact_ref[mask_bc]).item()
+                component_means = get_component_means(name, success_count)
+                ce_ic = component_means["ic"]
+                ce_bc_left = np.nan
+                ce_bc_right = np.nan
+                ce_bc = np.nan
+                ce_pde_scaled = component_means["pde_scaled"]
+                ce_pde_raw = component_means["pde_raw"]
+                ce_mass = component_means["mass"]
                 mass_t0 = u_pred_all[:, :, 0].mean(dim=1, keepdim=True)
                 mass_all_t = u_pred_all.mean(dim=1)
                 ce_cl = (mass_all_t - mass_t0).abs().mean().item()
@@ -167,13 +172,25 @@ def main():
                 speed = np.nan
                 residual = np.nan
                 ce_ic = np.nan
+                ce_bc_left = np.nan
+                ce_bc_right = np.nan
                 ce_bc = np.nan
+                ce_pde_scaled = np.nan
+                ce_pde_raw = np.nan
+                ce_mass = np.nan
                 ce_cl = np.nan
                 mmse = np.nan
                 smse = np.nan
                 sample_mse = np.nan
 
-            periodic_table.add_data(name, success_rate, success_count, speed, residual, ce_ic, ce_bc, ce_cl, mmse, smse, sample_mse)
+            periodic_log[f"Periodic/IC_Error/{name}"] = ce_ic
+            periodic_log[f"Periodic/BC_Left_Error/{name}"] = ce_bc_left
+            periodic_log[f"Periodic/BC_Right_Error/{name}"] = ce_bc_right
+            periodic_log[f"Periodic/BC_Error/{name}"] = ce_bc
+            periodic_log[f"Periodic/PDE_Error_Scaled/{name}"] = ce_pde_scaled
+            periodic_log[f"Periodic/PDE_Error_Raw/{name}"] = ce_pde_raw
+            periodic_log[f"Periodic/Mass_Error/{name}"] = ce_mass
+            periodic_table.add_data(name, success_rate, success_count, speed, residual, ce_ic, ce_bc_left, ce_bc_right, ce_bc, ce_pde_scaled, ce_pde_raw, ce_mass, ce_cl, mmse, smse, sample_mse)
 
         if len(periodic_log) > 2:
             periodic_log["Periodic/Results_Table"] = periodic_table
@@ -205,6 +222,32 @@ def main():
         method_active[method_name] = True
         method_success_counts[method_name] = 0
         method_failure_sample[method_name] = None
+        method_component_sums[method_name] = {
+            "ic": 0.0,
+            "pde_scaled": 0.0,
+            "pde_raw": 0.0,
+            "mass": 0.0,
+        }
+
+    def compute_component_errors(u_pred, u_true, physics_rules, physics_rules_pde):
+        u_pred_flat = u_pred.flatten()
+        ic_error = torch.nn.functional.mse_loss(u_pred[:, :, 0], u_true[:, :, 0]).item()
+        pde_raw_error = physics_rules_pde.pde_residual(u_pred_flat).abs().mean().item()
+        pde_scaled_error = pde_raw_error * (physics_rules_pde.dx ** 2)
+        mass_error = physics_rules.mass_residual_heat(u_pred_flat)[1:].abs().mean().item()
+        return {
+            "ic": ic_error,
+            "pde_scaled": pde_scaled_error,
+            "pde_raw": pde_raw_error,
+            "mass": mass_error,
+        }
+
+    def record_component_errors(name, component_errors):
+        for key, value in component_errors.items():
+            method_component_sums[name][key] += float(value)
+
+    def get_component_means(name, denom):
+        return {key: value / max(1, denom) for key, value in method_component_sums[name].items()}
 
     print("4. Iterative Generation (to respect the original Residuals class)...")
     sampler = FFM_sampler(model, model.gp)
@@ -225,45 +268,40 @@ def main():
         u_exact_i = u_exact[i:i+1].to(device)
         nu_exact = float(v_exact[i])
         
-        # Initialize the physics rules ONLY for this specific sample
-        physics_rules = HeatEquationResidualsFull(data=u_exact_i, nx=dims[0], nt=dims[1], nu=nu_exact) 
+        # Initialize the physics rules ONLY for this specific sample.
+        # Heat configs in this repository are IC-only, so the data mask follows cond_type=ic.
+        physics_rules = Residuals(
+            data=u_exact_i,
+            x=x_grid,
+            t_grid=t_grid,
+            nx=dims[0],
+            nt=dims[1],
+            nu=nu_exact,
+        )
+        physics_rules_pde = HeatEquationResidualsFull(data=u_exact_i, nx=dims[0], nt=dims[1], nu=nu_exact)
 
-        def guidance_hfunc(u_flat):
-            ic = physics_rules.ic_residual(u_flat)
-            mass = physics_rules.mass_residual(u_flat)
-            
-            # Moltiplichiamo per dx^2 per disinnescare l'esplosione sul rumore
-            pde = physics_rules.pde_residual(u_flat) * (physics_rules.dx ** 2) 
-            
-            return torch.cat([ic, mass, pde], dim=0)
+        def hfunc(u_flat):
+            return physics_rules.full_residual_heat(u_flat)
 
-        hfunc = guidance_hfunc
+        eval_hfunc = hfunc
 
         ic_err = physics_rules.ic_residual(u_exact_i.flatten()).abs().mean().item()
-        mass_err = physics_rules.mass_residual(u_exact_i.flatten()).abs().mean().item()
-        pde_err = physics_rules.pde_residual(u_exact_i.flatten()).abs().mean().item()
-    
-        print(f"Sanity Check -> IC: {ic_err:.5f} | Mass: {mass_err:.5f} | PDE: {pde_err:.5f}")
-        
-        # 1. Boolean mask creation for the constrained points (t=0, x=0, x=L)
+        mass_err = physics_rules.mass_residual_heat(u_exact_i.flatten())[1:].abs().mean().item()
+
+        print(f"Sanity Check -> IC: {ic_err:.5f} | Mass: {mass_err:.5f}")
+
+        # 1. Boolean mask creation for the constrained points (IC at t=0)
         mask_bool = torch.zeros_like(u_exact_i, dtype=torch.bool)
         mask_bool[:, :, 0] = True  # Condizione Iniziale (t=0)
-        #mask_bool[:, 0, :] = True  # Bordo sinistro (x=0)
-        #mask_bool[:, -1, :] = True # Bordo destro (x=L)
-        
+
         # Float version of the mask for loss computations in guided methods
         mask_float = mask_bool.float()
-        
+
         # 2. Loss Function for guided methods (DiffusionPDE, DFlow, PROFlow)
         def composite_loss_fn(u_pred, u_true, mask_tensor):
-            # Data term (IC/BC)
             data_loss = ((u_pred - u_true) * mask_tensor).square().sum()
-            
-            # PINN term (Physics) weighted at 1e-2 as per the paper
-            # Calculate the residual and take its loss (MSE)
             pinn_residual = hfunc(u_pred)
-            pinn_loss = (pinn_residual ** 2).sum() * 0.001
-            
+            pinn_loss = (pinn_residual ** 2).sum() * 0.01
             return data_loss + pinn_loss
 
         constraint = DirichletCondition(value=u_exact_i, mask=mask_bool)
@@ -272,9 +310,10 @@ def main():
         if method_active.get("ECI", False):
             start_t = time.time()
             u_eci = sampler.eci_sample(u0_i, args.n_steps, n_mix=5, resample_step=5, constraint=constraint)
-            res_eci = compute_physical_residual(u_eci, hfunc)
+            res_eci = compute_physical_residual(u_eci, eval_hfunc)
             end_t = time.time()
             if not deactivate_if_nan("ECI", res_eci, i):
+                record_component_errors("ECI", compute_component_errors(u_eci, u_exact_i, physics_rules, physics_rules_pde))
                 mark_success("ECI", u_eci, res_eci, start_t, end_t)
 
         # 6. DiffusionPDE
@@ -282,11 +321,12 @@ def main():
             start_t = time.time()
             u_diffpde = sampler.guided_sample(
                 u0_i, u_exact_i, mask_float, args.n_steps, 
-                loss_fn=composite_loss_fn, eta=1.0 
+                loss_fn=composite_loss_fn, eta=0.01 
             )
-            res_diffpde = compute_physical_residual(u_diffpde, hfunc)
+            res_diffpde = compute_physical_residual(u_diffpde, eval_hfunc)
             end_t = time.time()
             if not deactivate_if_nan("DiffusionPDE", res_diffpde, i):
+                record_component_errors("DiffusionPDE", compute_component_errors(u_diffpde, u_exact_i, physics_rules, physics_rules_pde))
                 mark_success("DiffusionPDE", u_diffpde, res_diffpde, start_t, end_t)
 
         # 7. D-Flow
@@ -296,18 +336,20 @@ def main():
                 u_exact_i, mask_float, n_sample=1, n_step=args.n_steps, 
                 n_iter=20, lr=1, loss_fn=composite_loss_fn
             )
-            res_dflow = compute_physical_residual(u_dflow, hfunc)
+            res_dflow = compute_physical_residual(u_dflow, eval_hfunc)
             end_t = time.time()
             if not deactivate_if_nan("DFlow", res_dflow, i):
+                record_component_errors("DFlow", compute_component_errors(u_dflow, u_exact_i, physics_rules, physics_rules_pde))
                 mark_success("DFlow", u_dflow, res_dflow, start_t, end_t)
 
         # 1. Vanilla FM
         if method_active.get("Vanilla", False):
             start_t = time.time()
             u_vanilla = sampler.vanilla_sample(u0_i, args.n_steps)
-            res_vanilla = compute_physical_residual(u_vanilla, hfunc)
+            res_vanilla = compute_physical_residual(u_vanilla, eval_hfunc)
             end_t = time.time()
             if not deactivate_if_nan("Vanilla", res_vanilla, i):
+                record_component_errors("Vanilla", compute_component_errors(u_vanilla, u_exact_i, physics_rules, physics_rules_pde))
                 mark_success("Vanilla", u_vanilla, res_vanilla, start_t, end_t)
 
 
@@ -315,9 +357,10 @@ def main():
         if method_active.get("PROFlow", False): 
             start_t = time.time()
             u_proflow = sampler.proflow_sample(u0_i, args.n_steps, hfunc, K=3, lr_base=0.01)
-            res_proflow = compute_physical_residual(u_proflow, hfunc)
+            res_proflow = compute_physical_residual(u_proflow, eval_hfunc)
             end_t = time.time()
             if not deactivate_if_nan("PROFlow", res_proflow, i):
+                record_component_errors("PROFlow", compute_component_errors(u_proflow, u_exact_i, physics_rules, physics_rules_pde))
                 mark_success("PROFlow", u_proflow, res_proflow, start_t, end_t)
 
         # 4. Original PCFM with the Float64 final projection fix
@@ -335,9 +378,10 @@ def main():
             u_pcfm_final_proj = fast_project_batched(u_flat_64, hfunc, max_iter=2)
             u_pcfm = u_pcfm_final_proj.view(u_pcfm_final_32.shape).to(torch.float32).detach()
             
-            res_pcfm = compute_physical_residual(u_pcfm, hfunc)
+            res_pcfm = compute_physical_residual(u_pcfm, eval_hfunc)
             end_t = time.time()
             if not deactivate_if_nan("PCFM", res_pcfm, i):
+                record_component_errors("PCFM", compute_component_errors(u_pcfm, u_exact_i, physics_rules, physics_rules_pde))
                 mark_success("PCFM", u_pcfm, res_pcfm, start_t, end_t)
 
 
@@ -346,10 +390,11 @@ def main():
             tracker_key = f"Ours_g{g}"
             if method_active.get(tracker_key, False):
                 start_t = time.time()
-                u_ours, _ = sampler.continuous_guided_sample(u0_i, args.n_steps, hfunc, gamma_max=g, final_refinement=True, refinement_steps=20, refinement_lr=0.1, gamma_schedule="sine")
-                res_ours = compute_physical_residual(u_ours, hfunc)
+                u_ours, _ = sampler.continuous_guided_sample(u0_i, args.n_steps, hfunc, gamma_max=g, final_refinement=False, refinement_steps=20, refinement_lr=0.1, gamma_schedule="sine")
+                res_ours = compute_physical_residual(u_ours, eval_hfunc)
                 end_t = time.time()
                 if not deactivate_if_nan(tracker_key, res_ours, i):
+                    record_component_errors(tracker_key, compute_component_errors(u_ours, u_exact_i, physics_rules, physics_rules_pde))
                     mark_success(tracker_key, u_ours, res_ours, start_t, end_t)
 
         if args.log_every > 0 and ((i + 1) % args.log_every == 0):
@@ -363,7 +408,7 @@ def main():
     # 5. Global metrics and Wnadb logging 
     print("\n6. Computing Distribution Metrics and Logging to Wandb...")
     wandb_log_dict = {}
-    columns = ["Method", "Success Rate (%)", "Generated Samples", "Speed (sec/sample)", "Physical Residual (MAE)", "IC Error", "BC Error", "CL Error", "MMSE", "SMSE", "SampleMSE"]
+    columns = ["Method", "Success Rate (%)", "Generated Samples", "Speed (sec/sample)", "Physical Residual (MAE)", "IC Error", "BC Left Error", "BC Right Error", "BC Error", "PDE Error (Scaled)", "PDE Error (Raw)", "Mass Error", "CL Error", "MMSE", "SMSE", "SampleMSE"]
     results_table = wandb.Table(columns=columns)
 
     for name, tracker in trackers.items():
@@ -377,19 +422,14 @@ def main():
             u_pred_all = tracker.get_all_samples_tensor()
             u_exact_ref = u_exact_all
 
-            mask_bc = torch.zeros_like(u_exact_ref, dtype=torch.bool)
-            mask_bc[:, 0, :] = True
-            mask_bc[:, -1, :] = True
-
-            ce_ic = torch.nn.functional.mse_loss(
-                u_pred_all[:, :, 0],
-                u_exact_ref[:, :, 0]
-            ).item()
-
-            ce_bc = torch.nn.functional.mse_loss(
-                u_pred_all[mask_bc],
-                u_exact_ref[mask_bc]
-            ).item()
+            component_means = get_component_means(name, success_count)
+            ce_ic = component_means["ic"]
+            ce_bc_left = np.nan
+            ce_bc_right = np.nan
+            ce_bc = np.nan
+            ce_pde_scaled = component_means["pde_scaled"]
+            ce_pde_raw = component_means["pde_raw"]
+            ce_mass = component_means["mass"]
 
             mass_t0 = u_pred_all[:, :, 0].mean(dim=1, keepdim=True) # [N, 1]
             mass_all_t = u_pred_all.mean(dim=1)                     # [N, nt]
@@ -408,7 +448,12 @@ def main():
             speed = np.nan
             residual = np.nan
             ce_ic = np.nan
+            ce_bc_left = np.nan
+            ce_bc_right = np.nan
             ce_bc = np.nan
+            ce_pde_scaled = np.nan
+            ce_pde_raw = np.nan
+            ce_mass = np.nan
             ce_cl = np.nan
             mmse = np.nan
             smse = np.nan
@@ -430,12 +475,17 @@ def main():
         wandb_log_dict[f"Speed (sec/sample)/{name}"] = speed
         wandb_log_dict[f"Physics_Error (MAE)/{name}"] = residual
         wandb_log_dict[f"Physics_Error_IC/{name}"] = ce_ic
+        wandb_log_dict[f"Physics_Error_BC_Left/{name}"] = ce_bc_left
+        wandb_log_dict[f"Physics_Error_BC_Right/{name}"] = ce_bc_right
         wandb_log_dict[f"Physics_Error_BC/{name}"] = ce_bc
+        wandb_log_dict[f"Physics_Error_PDE_Scaled/{name}"] = ce_pde_scaled
+        wandb_log_dict[f"Physics_Error_PDE_Raw/{name}"] = ce_pde_raw
+        wandb_log_dict[f"Physics_Error_Mass/{name}"] = ce_mass
         wandb_log_dict[f"Physics_Error_CL/{name}"] = ce_cl
         wandb_log_dict[f"Distribution_MMSE/{name}"] = mmse
         wandb_log_dict[f"Distribution_SMSE/{name}"] = smse
         wandb_log_dict[f"Distribution_SampleMSE/{name}"] = sample_mse
-        results_table.add_data(name, success_rate, success_count, speed, residual, ce_ic, ce_bc, ce_cl, mmse, smse, sample_mse)
+        results_table.add_data(name, success_rate, success_count, speed, residual, ce_ic, ce_bc_left, ce_bc_right, ce_bc, ce_pde_scaled, ce_pde_raw, ce_mass, ce_cl, mmse, smse, sample_mse)
 
     wandb_log_dict["Final_Results_Table"] = results_table
     wandb.log(wandb_log_dict)

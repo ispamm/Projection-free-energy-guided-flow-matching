@@ -46,21 +46,21 @@ def _reshape_to_2d(data, nx, nt):
 
 
 class HeatEquationResidualsFull:
-    def __init__(self, data, nx=100, nt=100, nu=0.01):
+    def __init__(self, data, nx=100, nt=100, nu=0.01, spatial_domain=(0.0, 2.0 * math.pi), time_domain=(0.0, 1.0)):
         self.device = data.device
         self.nx = nx
         self.nt = nt
         self.nu = float(nu)
+        self.spatial_domain = tuple(spatial_domain)
+        self.time_domain = tuple(time_domain)
         
         # Robustly reshape input to [nx, nt]
         data_reshaped = _reshape_to_2d(data, nx, nt)
         self.data = data_reshaped.to(device=self.device, dtype=torch.float32)
         
-        # --- LA SOLUZIONE: Hardcoding dei passi fisici ---
-        # Ignoriamo le griglie dello script che potrebbero essere normalizzate.
-        # Sappiamo dal dataset che x è in [0, 2π] e t è in [0, 1].
-        self.dx = (2.0 * math.pi) / self.nx
-        self.dt = 1.0 / (self.nt - 1)
+        # Diffusion dataset uses periodic x-grid with endpoint excluded and full [t0, t1] time range.
+        self.dx = (self.spatial_domain[1] - self.spatial_domain[0]) / self.nx
+        self.dt = (self.time_domain[1] - self.time_domain[0]) / (self.nt - 1)
 
     def ic_residual(self, u_flat):
         u = u_flat.to(dtype=torch.float32).view(self.nx, self.nt)
@@ -90,6 +90,41 @@ class HeatEquationResidualsFull:
             self.mass_residual(u_flat), 
             self.pde_residual(u_flat)
         ], dim=0)
+
+
+class HeatEquationResidualsFullPDE(HeatEquationResidualsFull):
+    """Heat residual with IC, mass conservation, and PDE term for full guidance."""
+
+    def __init__(self, data, nx=100, nt=100, nu=0.01, spatial_domain=(0.0, 2.0 * math.pi), time_domain=(0.0, 1.0), pde_scale=None):
+        super().__init__(
+            data=data,
+            nx=nx,
+            nt=nt,
+            nu=nu,
+            spatial_domain=spatial_domain,
+            time_domain=time_domain,
+        )
+        self.pde_scale = float(self.dx ** 2 if pde_scale is None else pde_scale)
+
+    def pde_residual_scaled(self, u_flat):
+        return self.pde_residual(u_flat) * self.pde_scale
+
+    def full_residual(self, u_flat):
+        return torch.cat([
+            self.ic_residual(u_flat),
+            self.mass_residual(u_flat),
+            self.pde_residual_scaled(u_flat),
+        ], dim=0)
+
+    def full_residual_unscaled(self, u_flat):
+        return torch.cat([
+            self.ic_residual(u_flat),
+            self.mass_residual(u_flat),
+            self.pde_residual(u_flat),
+        ], dim=0)
+
+    def __call__(self, u_flat):
+        return self.full_residual(u_flat)
 
 
 class BurgersEquationResidualsFull:
