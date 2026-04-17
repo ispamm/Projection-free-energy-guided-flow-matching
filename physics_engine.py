@@ -127,6 +127,126 @@ class HeatEquationResidualsFullPDE(HeatEquationResidualsFull):
         return self.full_residual(u_flat)
 
 
+class ReactionDiffusionResidualsFull:
+    """Reaction-Diffusion residuals aligned with the generated RD dataset."""
+
+    def __init__(
+        self,
+        data,
+        nx=128,
+        nt=100,
+        nu=0.005,
+        rho=0.01,
+        x_grid=None,
+        t_grid=None,
+        spatial_domain=(0.0, 1.0),
+        time_domain=(0.0, 0.99),
+        pde_scale=None,
+    ):
+        self.device = data.device
+        self.nx = nx
+        self.nt = nt
+        self.nu = float(nu)
+        self.rho = float(rho)
+
+        data_reshaped = _reshape_to_2d(data, nx, nt)
+        self.data = data_reshaped.to(device=self.device, dtype=torch.float32)
+
+        if x_grid is None:
+            self.x_grid = torch.linspace(spatial_domain[0], spatial_domain[1], nx, device=self.device)
+        else:
+            self.x_grid = x_grid.to(device=self.device, dtype=torch.float32)
+
+        if t_grid is None:
+            self.t_grid = torch.linspace(time_domain[0], time_domain[1], nt, device=self.device)
+        else:
+            self.t_grid = t_grid.to(device=self.device, dtype=torch.float32)
+
+        self.dx = (self.x_grid[1] - self.x_grid[0]).item()
+        self.dt = (self.t_grid[1] - self.t_grid[0]).item()
+        self.pde_scale = float(self.dx ** 2 if pde_scale is None else pde_scale)
+
+    def ic_residual(self, u_flat):
+        u = u_flat.to(dtype=torch.float32).view(self.nx, self.nt)
+        return (u[:, 0] - self.data[:, 0]).flatten()
+
+    def _boundary_fluxes(self, u):
+        # Match the same 4th-order one-sided flux approximation used in pcfm.constraints.Residuals.mass_residual_rd
+        gL_t = -self.nu * (-25 * u[0, :] + 48 * u[1, :] - 36 * u[2, :] + 16 * u[3, :] - 3 * u[4, :]) / (12 * self.dx)
+        gR_t = -self.nu * (25 * u[-1, :] - 48 * u[-2, :] + 36 * u[-3, :] - 16 * u[-4, :] + 3 * u[-5, :]) / (12 * self.dx)
+        return gL_t, gR_t
+
+    def bc_left_flux(self, u_flat):
+        u = u_flat.to(dtype=torch.float32).view(self.nx, self.nt)
+        gL_t, _ = self._boundary_fluxes(u)
+        return gL_t
+
+    def bc_right_flux(self, u_flat):
+        u = u_flat.to(dtype=torch.float32).view(self.nx, self.nt)
+        _, gR_t = self._boundary_fluxes(u)
+        return gR_t
+
+    def bc_left_residual(self, u_flat):
+        u = u_flat.to(dtype=torch.float32).view(self.nx, self.nt)
+        gL_t, _ = self._boundary_fluxes(u)
+        gL_ref, _ = self._boundary_fluxes(self.data)
+        return gL_t - gL_ref
+
+    def bc_right_residual(self, u_flat):
+        u = u_flat.to(dtype=torch.float32).view(self.nx, self.nt)
+        _, gR_t = self._boundary_fluxes(u)
+        _, gR_ref = self._boundary_fluxes(self.data)
+        return gR_t - gR_ref
+
+    def bc_residual(self, u_flat):
+        return torch.cat([self.bc_left_residual(u_flat), self.bc_right_residual(u_flat)], dim=0)
+
+    def mass_residual(self, u_flat):
+        # Integral balance: mass(t) = mass(0) + integrated reaction + integrated boundary flux
+        u = u_flat.to(dtype=torch.float32).view(self.nx, self.nt)
+        mass = u.sum(dim=0) * self.dx
+
+        source = self.rho * (u * (1.0 - u)).sum(dim=0) * self.dx
+        source_mid = 0.5 * (source[:-1] + source[1:])
+        dt_vec = (self.t_grid[1:] - self.t_grid[:-1]).to(u.device)
+        source_cum = torch.cat([torch.zeros(1, device=u.device), torch.cumsum(source_mid * dt_vec, dim=0)], dim=0)
+
+        gL_t, gR_t = self._boundary_fluxes(u)
+        flux = gL_t - gR_t
+        flux_mid = 0.5 * (flux[:-1] + flux[1:])
+        flux_cum = torch.cat([torch.zeros(1, device=u.device), torch.cumsum(flux_mid * dt_vec, dim=0)], dim=0)
+
+        return mass - (mass[0] + source_cum + flux_cum)
+
+    def pde_residual(self, u_flat):
+        u = u_flat.to(dtype=torch.float32).view(self.nx, self.nt)
+
+        u_t = (u[:, 1:] - u[:, :-1]) / self.dt
+        u_xx = (u[2:, :-1] - 2.0 * u[1:-1, :-1] + u[:-2, :-1]) / (self.dx ** 2)
+        reaction = self.rho * u[1:-1, :-1] * (1.0 - u[1:-1, :-1])
+        res = u_t[1:-1, :] - self.nu * u_xx - reaction
+        return res.flatten()
+
+    def pde_residual_scaled(self, u_flat):
+        return self.pde_residual(u_flat) * self.pde_scale
+
+    def full_residual(self, u_flat):
+        return torch.cat([
+            self.ic_residual(u_flat),
+            self.bc_residual(u_flat),
+            self.pde_residual_scaled(u_flat),
+            self.mass_residual(u_flat)[1:],
+        ], dim=0)
+
+    def full_residual_unscaled(self, u_flat):
+        return torch.cat([
+            self.ic_residual(u_flat),
+            self.bc_residual(u_flat),
+            self.pde_residual(u_flat),
+            self.mass_residual(u_flat)[1:],
+        ], dim=0)
+
+
 class BurgersEquationResidualsFull:
     def __init__(self, data, nx=100, nt=100, nu=0.01, spatial_domain=[0, 2*math.pi], time_domain=[0, 1]):
         self.device = data.device

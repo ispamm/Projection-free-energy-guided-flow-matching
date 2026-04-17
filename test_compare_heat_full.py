@@ -349,7 +349,7 @@ def main():
             start_t = time.time()
             u_pcfm_i = sampler.pcfm_sample(
                 u0_i, args.n_steps, hfunc=hfunc, newtonsteps=1,
-                guided_interpolation=False,
+                guided_interpolation=True,
                 interpolation_params={'custom_lam': 1.0, 'step_size': 0.01, 'num_steps': 20}
             )
             u_pcfm_final_32 = u_pcfm_i.detach()

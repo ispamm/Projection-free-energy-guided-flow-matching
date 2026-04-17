@@ -369,7 +369,7 @@ def main():
             # Flow Matching con parametri Appendice H
             u_pcfm_i = sampler.pcfm_sample(
                 u0_i, args.n_steps, hfunc=hfunc, newtonsteps=1,
-                guided_interpolation=False,
+                guided_interpolation=True,
                 interpolation_params={'custom_lam': 1.0, 'step_size': 0.01, 'num_steps': 20}
             )
             # Final projection Float64
