@@ -125,6 +125,17 @@ class BurgersEquationResidualsFull:
         
         return torch.cat([res_left, res_right]).flatten()
 
+    def bc_left_residual(self, u):
+        """Residuo della sola condizione al contorno sinistra (Dirichlet)."""
+        u = _reshape_to_2d(u, self.nx, self.nt).to(device=self.device)
+        left_target = self.data[0, :]
+        return (u[0, :] - left_target).flatten()
+
+    def bc_right_residual(self, u):
+        """Residuo della sola condizione al contorno destra (Neumann zero-gradient)."""
+        u = _reshape_to_2d(u, self.nx, self.nt).to(device=self.device)
+        return (u[-1, :] - u[-2, :]).flatten()
+
     def pde_residual(self, u):
         """Residuo Equazione di Burgers: u_t + u*u_x = nu*u_xx"""
         # Accetta input 1D/2D/3D e normalizza a [nx, nt]
@@ -153,3 +164,40 @@ class BurgersEquationResidualsFull:
         
         # Concateniamo tutto: questo è il vettore h(u)
         return torch.cat([ic, bc, pde])
+
+
+class BurgersEquationResidualsFullPDE(BurgersEquationResidualsFull):
+    """Burgers residual with IC, boundary errors, and nonlinear PDE only.
+
+    This variant keeps the same boundary convention as the generated dataset
+    and scales the PDE block for stable guided sampling.
+    """
+
+    def __init__(self, data, nx=100, nt=100, nu=0.01, spatial_domain=[0, 1], time_domain=[0, 1], pde_scale=None):
+        super().__init__(
+            data=data,
+            nx=nx,
+            nt=nt,
+            nu=nu,
+            spatial_domain=spatial_domain,
+            time_domain=time_domain,
+        )
+        self.pde_scale = float(self.dx ** 2 if pde_scale is None else pde_scale)
+
+    def full_residual(self, u_flat):
+        ic = self.ic_residual(u_flat)
+        bc = self.bc_residual(u_flat)
+        pde = self.pde_residual(u_flat) * self.pde_scale
+        return torch.cat([ic, bc, pde], dim=0)
+
+    def pde_residual_scaled(self, u_flat):
+        return self.pde_residual(u_flat) * self.pde_scale
+
+    def full_residual_unscaled(self, u_flat):
+        ic = self.ic_residual(u_flat)
+        bc = self.bc_residual(u_flat)
+        pde = self.pde_residual(u_flat)
+        return torch.cat([ic, bc, pde], dim=0)
+
+    def __call__(self, u_flat):
+        return self.full_residual(u_flat)
