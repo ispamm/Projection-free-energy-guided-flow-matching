@@ -95,7 +95,17 @@ class HeatEquationResidualsFull:
 class HeatEquationResidualsFullPDE(HeatEquationResidualsFull):
     """Heat residual with IC, mass conservation, and PDE term for full guidance."""
 
-    def __init__(self, data, nx=100, nt=100, nu=0.01, spatial_domain=(0.0, 2.0 * math.pi), time_domain=(0.0, 1.0), pde_scale=None):
+    def __init__(
+        self,
+        data,
+        nx=100,
+        nt=100,
+        nu=0.01,
+        spatial_domain=(0.0, 2.0 * math.pi),
+        time_domain=(0.0, 1.0),
+        pde_scale=None,
+        include_mass=False,
+    ):
         super().__init__(
             data=data,
             nx=nx,
@@ -105,23 +115,28 @@ class HeatEquationResidualsFullPDE(HeatEquationResidualsFull):
             time_domain=time_domain,
         )
         self.pde_scale = float(self.dx ** 2 if pde_scale is None else pde_scale)
+        self.include_mass = bool(include_mass)
 
     def pde_residual_scaled(self, u_flat):
         return self.pde_residual(u_flat) * self.pde_scale
 
     def full_residual(self, u_flat):
-        return torch.cat([
+        blocks = [
             self.ic_residual(u_flat),
-            self.mass_residual(u_flat),
             self.pde_residual_scaled(u_flat),
-        ], dim=0)
+        ]
+        if self.include_mass:
+            blocks.append(self.mass_residual(u_flat))
+        return torch.cat(blocks, dim=0)
 
     def full_residual_unscaled(self, u_flat):
-        return torch.cat([
+        blocks = [
             self.ic_residual(u_flat),
-            self.mass_residual(u_flat),
             self.pde_residual(u_flat),
-        ], dim=0)
+        ]
+        if self.include_mass:
+            blocks.append(self.mass_residual(u_flat))
+        return torch.cat(blocks, dim=0)
 
     def __call__(self, u_flat):
         return self.full_residual(u_flat)
@@ -142,6 +157,7 @@ class ReactionDiffusionResidualsFull:
         spatial_domain=(0.0, 1.0),
         time_domain=(0.0, 0.99),
         pde_scale=None,
+        include_mass=False,
     ):
         self.device = data.device
         self.nx = nx
@@ -165,6 +181,7 @@ class ReactionDiffusionResidualsFull:
         self.dx = (self.x_grid[1] - self.x_grid[0]).item()
         self.dt = (self.t_grid[1] - self.t_grid[0]).item()
         self.pde_scale = float(self.dx ** 2 if pde_scale is None else pde_scale)
+        self.include_mass = bool(include_mass)
 
     def ic_residual(self, u_flat):
         u = u_flat.to(dtype=torch.float32).view(self.nx, self.nt)
@@ -231,20 +248,206 @@ class ReactionDiffusionResidualsFull:
         return self.pde_residual(u_flat) * self.pde_scale
 
     def full_residual(self, u_flat):
-        return torch.cat([
+        blocks = [
+            self.ic_residual(u_flat),
+            self.pde_residual_scaled(u_flat),
+        ]
+        if self.include_mass:
+            blocks.append(self.mass_residual(u_flat)[1:])
+        return torch.cat(blocks, dim=0)
+
+    def full_residual_unscaled(self, u_flat):
+        blocks = [
+            self.ic_residual(u_flat),
+            self.pde_residual(u_flat),
+        ]
+        if self.include_mass:
+            blocks.append(self.mass_residual(u_flat)[1:])
+        return torch.cat(blocks, dim=0)
+
+
+class NavierStokesResidualsFullPDE:
+    """2D vorticity-form Navier-Stokes residuals for periodic datasets.
+
+    The formulation matches the generated dataset conventions:
+    - periodic domain on x and y in [0, 1)
+    - forcing field f(x, y) constant in time
+    - viscosity nu (mu in dataset filename)
+    """
+
+    def __init__(
+        self,
+        data,
+        forcing,
+        nx=64,
+        ny=64,
+        nt=50,
+        nu=0.001,
+        x_grid=None,
+        y_grid=None,
+        t_grid=None,
+        spatial_domain=(0.0, 1.0),
+        time_domain=(0.0, 49.0),
+        pde_scale=None,
+        include_mass=False,
+    ):
+        self.device = data.device
+        self.nx = nx
+        self.ny = ny
+        self.nt = nt
+        self.nu = float(nu)
+
+        data_tensor = data.to(device=self.device, dtype=torch.float32)
+        if data_tensor.dim() == 4 and data_tensor.shape[0] == 1:
+            data_tensor = data_tensor.squeeze(0)
+        if data_tensor.dim() != 3:
+            raise ValueError(f"Expected NS data with 3 dims [nx, ny, nt], got {tuple(data.shape)}")
+        if data_tensor.shape != (nx, ny, nt):
+            raise ValueError(
+                f"NS data shape mismatch: expected {(nx, ny, nt)}, got {tuple(data_tensor.shape)}"
+            )
+        self.data = data_tensor
+
+        forcing_tensor = forcing.to(device=self.device, dtype=torch.float32)
+        if forcing_tensor.dim() == 3 and forcing_tensor.shape[0] == 1:
+            forcing_tensor = forcing_tensor.squeeze(0)
+        if forcing_tensor.dim() != 2:
+            raise ValueError(f"Expected forcing with 2 dims [nx, ny], got {tuple(forcing.shape)}")
+        if forcing_tensor.shape != (nx, ny):
+            raise ValueError(
+                f"Forcing shape mismatch: expected {(nx, ny)}, got {tuple(forcing_tensor.shape)}"
+            )
+        self.forcing = forcing_tensor
+
+        if x_grid is None:
+            self.x_grid = torch.linspace(spatial_domain[0], spatial_domain[1], nx + 1, device=self.device)[:-1]
+        else:
+            self.x_grid = x_grid.to(device=self.device, dtype=torch.float32)
+
+        if y_grid is None:
+            self.y_grid = torch.linspace(spatial_domain[0], spatial_domain[1], ny + 1, device=self.device)[:-1]
+        else:
+            self.y_grid = y_grid.to(device=self.device, dtype=torch.float32)
+
+        if t_grid is None:
+            self.t_grid = torch.linspace(time_domain[0], time_domain[1], nt, device=self.device)
+        else:
+            self.t_grid = t_grid.to(device=self.device, dtype=torch.float32)
+
+        self.dx = (self.x_grid[1] - self.x_grid[0]).item()
+        self.dy = (self.y_grid[1] - self.y_grid[0]).item()
+        self.dt = (self.t_grid[1] - self.t_grid[0]).item()
+        self.pde_scale = float((min(self.dx, self.dy) ** 2) if pde_scale is None else pde_scale)
+        self.include_mass = bool(include_mass)
+
+        kx = torch.fft.fftfreq(self.nx, d=self.dx, device=self.device).view(self.nx, 1)
+        ky = torch.fft.fftfreq(self.ny, d=self.dy, device=self.device).view(1, self.ny)
+        self.kx = kx
+        self.ky = ky
+        self.lap = (2.0 * math.pi) ** 2 * (kx ** 2 + ky ** 2)
+        self.lap[0, 0] = 1.0
+
+    def _reshape(self, u_flat):
+        u = u_flat.to(dtype=torch.float32)
+        if u.dim() == 1:
+            u = u.view(self.nx, self.ny, self.nt)
+        elif u.dim() == 4 and u.shape[0] == 1:
+            u = u.squeeze(0)
+        elif u.dim() == 3:
+            pass
+        else:
+            raise ValueError(f"Unsupported NS tensor shape: {tuple(u.shape)}")
+
+        if u.shape != (self.nx, self.ny, self.nt):
+            raise ValueError(
+                f"NS tensor shape mismatch: expected {(self.nx, self.ny, self.nt)}, got {tuple(u.shape)}"
+            )
+        return u
+
+    def ic_residual(self, u_flat):
+        u = self._reshape(u_flat)
+        return (u[:, :, 0] - self.data[:, :, 0]).flatten()
+
+    def mass_residual(self, u_flat):
+        u = self._reshape(u_flat)
+        mass_t = u.sum(dim=(0, 1)) * self.dx * self.dy
+        return (mass_t[1:] - mass_t[0]).flatten()
+
+    def bc_left_residual(self, u_flat):
+        u = self._reshape(u_flat)
+        # On endpoint-excluded periodic grids, u[0] and u[-1] are not the same point.
+        # We compare the seam jump against the reference data seam jump.
+        pred_jump = u[0, :, :] - u[-1, :, :]
+        ref_jump = self.data[0, :, :] - self.data[-1, :, :]
+        return (pred_jump - ref_jump).flatten()
+
+    def bc_right_residual(self, u_flat):
+        u = self._reshape(u_flat)
+        pred_jump = u[:, 0, :] - u[:, -1, :]
+        ref_jump = self.data[:, 0, :] - self.data[:, -1, :]
+        return (pred_jump - ref_jump).flatten()
+
+    def bc_residual(self, u_flat):
+        return torch.cat([self.bc_left_residual(u_flat), self.bc_right_residual(u_flat)], dim=0)
+
+    def pde_residual(self, u_flat):
+        w = self._reshape(u_flat)
+
+        w_t = (w[:, :, 1:] - w[:, :, :-1]) / self.dt
+        w_old = w[:, :, :-1]
+
+        w_h = torch.fft.fftn(w_old, dim=(0, 1), norm='backward')
+        lap = self.lap.unsqueeze(-1)
+        kx = self.kx.unsqueeze(-1)
+        ky = self.ky.unsqueeze(-1)
+
+        psi_h = w_h / lap
+
+        q_h = 1j * 2.0 * math.pi * ky * psi_h
+        v_h = -1j * 2.0 * math.pi * kx * psi_h
+        q = torch.fft.ifftn(q_h, dim=(0, 1), norm='backward').real
+        v = torch.fft.ifftn(v_h, dim=(0, 1), norm='backward').real
+
+        w_x_h = 1j * 2.0 * math.pi * kx * w_h
+        w_y_h = 1j * 2.0 * math.pi * ky * w_h
+        w_x = torch.fft.ifftn(w_x_h, dim=(0, 1), norm='backward').real
+        w_y = torch.fft.ifftn(w_y_h, dim=(0, 1), norm='backward').real
+
+        advection = q * w_x + v * w_y
+
+        lap_w_h = -lap * w_h
+        lap_w = torch.fft.ifftn(lap_w_h, dim=(0, 1), norm='backward').real
+        diffusion = self.nu * lap_w
+
+        forcing = self.forcing.unsqueeze(-1)
+        res = w_t + advection - diffusion - forcing
+        return res.flatten()
+
+    def pde_residual_scaled(self, u_flat):
+        return self.pde_residual(u_flat) * self.pde_scale
+
+    def full_residual(self, u_flat):
+        blocks = [
             self.ic_residual(u_flat),
             self.bc_residual(u_flat),
             self.pde_residual_scaled(u_flat),
-            self.mass_residual(u_flat)[1:],
-        ], dim=0)
+        ]
+        if self.include_mass:
+            blocks.append(self.mass_residual(u_flat)[1:])
+        return torch.cat(blocks, dim=0)
 
     def full_residual_unscaled(self, u_flat):
-        return torch.cat([
+        blocks = [
             self.ic_residual(u_flat),
             self.bc_residual(u_flat),
             self.pde_residual(u_flat),
-            self.mass_residual(u_flat)[1:],
-        ], dim=0)
+        ]
+        if self.include_mass:
+            blocks.append(self.mass_residual(u_flat)[1:])
+        return torch.cat(blocks, dim=0)
+
+    def __call__(self, u_flat):
+        return self.full_residual(u_flat)
 
 
 class BurgersEquationResidualsFull:
