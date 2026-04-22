@@ -144,6 +144,20 @@ def pcfm_sample(
 
     for _ in range(newtonsteps):
         res = hfunc(u_corr)
+        m = res.numel()
+        n = u_corr.numel()
+        bytes_per_elem = torch.tensor([], dtype=u_corr.dtype).element_size()
+        jacobian_gib = (m * n * bytes_per_elem) / (1024 ** 3)
+
+        # Dense Jacobian assembly scales as O(m*n) memory and quickly becomes infeasible
+        # for full 2D NS grids. Fail fast with an actionable message instead of opaque CUDA OOM.
+        if jacobian_gib > 24.0:
+            raise RuntimeError(
+                f"PCFM dense Jacobian too large for this setup: J shape [{m}, {n}] "
+                f"(~{jacobian_gib:.2f} GiB for dtype={u_corr.dtype}). "
+                "Use smaller spatial/temporal resolution or implement an implicit Jacobian solver."
+            )
+
         J = compute_jacobian(hfunc, u_corr)
         JJt = J @ J.T
         rhs = res

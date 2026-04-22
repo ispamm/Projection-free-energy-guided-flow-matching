@@ -319,7 +319,7 @@ def main():
             start_t = time.time()
             u_dflow = sampler.dflow_sample(
                 u_exact_i, mask_float, n_sample=1, n_step=args.n_steps,
-                n_iter=20, lr=1, loss_fn=composite_loss_fn
+                n_iter=10, lr=0.01, loss_fn=composite_loss_fn
             )
             res_dflow = compute_physical_residual(u_dflow, eval_hfunc)
             end_t = time.time()

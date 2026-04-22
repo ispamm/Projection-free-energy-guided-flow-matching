@@ -390,7 +390,7 @@ def main():
             tracker_key = f"Ours_g{g}"
             if method_active.get(tracker_key, False):
                 start_t = time.time()
-                u_ours, _ = sampler.continuous_guided_sample(u0_i, args.n_steps, hfunc, gamma_max=g, final_refinement=False, refinement_steps=20, refinement_lr=0.1, gamma_schedule="sine")
+                u_ours, _ = sampler.continuous_guided_sample(u0_i, args.n_steps, hfunc, gamma_max=g, final_refinement=True, refinement_steps=200, refinement_lr=0.1, gamma_schedule="sine")
                 res_ours = compute_physical_residual(u_ours, eval_hfunc)
                 end_t = time.time()
                 if not deactivate_if_nan(tracker_key, res_ours, i):

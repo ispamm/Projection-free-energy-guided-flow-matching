@@ -158,6 +158,7 @@ def main():
     method_active = {}
     method_success_counts = {}
     method_failure_sample = {}
+    method_failure_reason = {}
     method_component_sums = {}
 
     def mark_success(name, sample, residual, start_t, end_t):
@@ -168,12 +169,45 @@ def main():
         if not np.isfinite(residual):
             method_active[name] = False
             method_failure_sample[name] = sample_idx + 1
+            method_failure_reason[name] = "NAN_INF"
             print(
                 f"[DISABLE] {name} produced Physics_Error={residual} "
                 f"at sample {sample_idx + 1}/{args.n_samples}. Skipping it for remaining samples."
             )
             return True
         return False
+
+    def deactivate_if_exception(name, exc, sample_idx):
+        msg = str(exc)
+        msg_lower = msg.lower()
+        is_oom = (
+            isinstance(exc, torch.OutOfMemoryError)
+            or ("out of memory" in msg_lower)
+            or ("dense jacobian too large" in msg_lower)
+        )
+        if is_oom:
+            torch.cuda.empty_cache()
+            method_active[name] = False
+            method_failure_sample[name] = sample_idx + 1
+            method_failure_reason[name] = "OOM"
+            print(
+                f"[DISABLE] {name} hit OOM at sample {sample_idx + 1}/{args.n_samples}. "
+                "Skipping it for remaining samples."
+            )
+            return True
+        return False
+
+    def get_method_status(name, expected_samples):
+        reason = method_failure_reason[name]
+        if reason == "OOM":
+            return "OOM"
+        if reason == "NAN_INF":
+            return "NAN_INF"
+        if method_success_counts[name] == expected_samples:
+            return "OK"
+        if method_success_counts[name] > 0:
+            return "PARTIAL"
+        return "NOT_RUN"
 
     def log_periodic_metrics(processed_samples: int):
         if processed_samples <= 0:
@@ -195,6 +229,7 @@ def main():
                 "Method",
                 "Success Rate (%)",
                 "Generated Samples",
+                "Status",
                 "Speed (sec/sample)",
                 "Physical Residual (MAE)",
                 "IC Error",
@@ -215,6 +250,7 @@ def main():
             success_count = method_success_counts[name]
             success_rate = 100.0 * success_count / max(1, args.n_samples)
             failed_with_nan = method_failure_sample[name] is not None
+            status = get_method_status(name, args.n_samples)
 
             if (not failed_with_nan) and success_count == args.n_samples:
                 u_pred_all = tracker.get_all_samples_tensor()
@@ -259,11 +295,14 @@ def main():
             periodic_log[f"Periodic/PDE_Error_Scaled/{name}"] = ce_pde_scaled
             periodic_log[f"Periodic/PDE_Error_Raw/{name}"] = ce_pde_raw
             periodic_log[f"Periodic/Mass_Error/{name}"] = ce_mass
+            periodic_log[f"Periodic/Status/{name}"] = status
+            periodic_log[f"Periodic/OOM_Flag/{name}"] = 1 if status == "OOM" else 0
 
             periodic_table.add_data(
                 name,
                 success_rate,
                 success_count,
+                status,
                 speed,
                 residual,
                 ce_ic,
@@ -309,6 +348,7 @@ def main():
         method_active[method_name] = True
         method_success_counts[method_name] = 0
         method_failure_sample[method_name] = None
+        method_failure_reason[method_name] = None
         method_component_sums[method_name] = {
             "ic": 0.0,
             "bc_left": 0.0,
@@ -352,7 +392,7 @@ def main():
     print("5. Start Inference Loop...")
     for i in range(args.n_samples):
         if not any(method_active.values()):
-            print("\n[EARLY STOP] All methods disabled due to NaN/Inf Physics_Error.")
+            print("\n[EARLY STOP] All methods disabled (OOM and/or NaN/Inf).")
             break
 
         if i % 10 == 0:
@@ -412,103 +452,131 @@ def main():
 
         if method_active.get("ECI", False):
             start_t = time.time()
-            u_eci = sampler.eci_sample(u0_i, args.n_steps, n_mix=5, resample_step=5, constraint=constraint)
-            res_eci = compute_physical_residual(u_eci, eval_hfunc)
-            end_t = time.time()
-            if not deactivate_if_nan("ECI", res_eci, i):
-                record_component_errors("ECI", compute_component_errors(u_eci, u_exact_i, physics_rules_eval))
-                mark_success("ECI", u_eci, res_eci, start_t, end_t)
+            try:
+                u_eci = sampler.eci_sample(u0_i, args.n_steps, n_mix=5, resample_step=5, constraint=constraint)
+                res_eci = compute_physical_residual(u_eci, eval_hfunc)
+                end_t = time.time()
+                if not deactivate_if_nan("ECI", res_eci, i):
+                    record_component_errors("ECI", compute_component_errors(u_eci, u_exact_i, physics_rules_eval))
+                    mark_success("ECI", u_eci, res_eci, start_t, end_t)
+            except RuntimeError as exc:
+                if not deactivate_if_exception("ECI", exc, i):
+                    raise
 
         if method_active.get("DiffusionPDE", False):
             start_t = time.time()
-            u_diffpde = sampler.guided_sample(
-                u0_i,
-                u_exact_i,
-                mask_float,
-                args.n_steps,
-                loss_fn=composite_loss_fn,
-                eta=0.01,
-            )
-            res_diffpde = compute_physical_residual(u_diffpde, eval_hfunc)
-            end_t = time.time()
-            if not deactivate_if_nan("DiffusionPDE", res_diffpde, i):
-                record_component_errors("DiffusionPDE", compute_component_errors(u_diffpde, u_exact_i, physics_rules_eval))
-                mark_success("DiffusionPDE", u_diffpde, res_diffpde, start_t, end_t)
+            try:
+                u_diffpde = sampler.guided_sample(
+                    u0_i,
+                    u_exact_i,
+                    mask_float,
+                    args.n_steps,
+                    loss_fn=composite_loss_fn,
+                    eta=0.01,
+                )
+                res_diffpde = compute_physical_residual(u_diffpde, eval_hfunc)
+                end_t = time.time()
+                if not deactivate_if_nan("DiffusionPDE", res_diffpde, i):
+                    record_component_errors("DiffusionPDE", compute_component_errors(u_diffpde, u_exact_i, physics_rules_eval))
+                    mark_success("DiffusionPDE", u_diffpde, res_diffpde, start_t, end_t)
+            except RuntimeError as exc:
+                if not deactivate_if_exception("DiffusionPDE", exc, i):
+                    raise
 
         if method_active.get("DFlow", False):
             start_t = time.time()
-            u_dflow = sampler.dflow_ns_sample(
-                u_exact_i,
-                mask_float,
-                n_sample=1,
-                n_step=args.n_steps,
-                n_iter=10,
-                lr=0.01,
-                loss_fn=composite_loss_fn,
-            )
-            res_dflow = compute_physical_residual(u_dflow, eval_hfunc)
-            end_t = time.time()
-            if not deactivate_if_nan("DFlow", res_dflow, i):
-                record_component_errors("DFlow", compute_component_errors(u_dflow, u_exact_i, physics_rules_eval))
-                mark_success("DFlow", u_dflow, res_dflow, start_t, end_t)
+            try:
+                u_dflow = sampler.dflow_ns_sample(
+                    u_exact_i,
+                    mask_float,
+                    n_sample=1,
+                    n_step=args.n_steps,
+                    n_iter=10,
+                    lr=0.01,
+                    loss_fn=composite_loss_fn,
+                )
+                res_dflow = compute_physical_residual(u_dflow, eval_hfunc)
+                end_t = time.time()
+                if not deactivate_if_nan("DFlow", res_dflow, i):
+                    record_component_errors("DFlow", compute_component_errors(u_dflow, u_exact_i, physics_rules_eval))
+                    mark_success("DFlow", u_dflow, res_dflow, start_t, end_t)
+            except RuntimeError as exc:
+                if not deactivate_if_exception("DFlow", exc, i):
+                    raise
 
         if method_active.get("Vanilla", False):
             start_t = time.time()
-            u_vanilla = sampler.vanilla_sample(u0_i, args.n_steps)
-            res_vanilla = compute_physical_residual(u_vanilla, eval_hfunc)
-            end_t = time.time()
-            if not deactivate_if_nan("Vanilla", res_vanilla, i):
-                record_component_errors("Vanilla", compute_component_errors(u_vanilla, u_exact_i, physics_rules_eval))
-                mark_success("Vanilla", u_vanilla, res_vanilla, start_t, end_t)
+            try:
+                u_vanilla = sampler.vanilla_sample(u0_i, args.n_steps)
+                res_vanilla = compute_physical_residual(u_vanilla, eval_hfunc)
+                end_t = time.time()
+                if not deactivate_if_nan("Vanilla", res_vanilla, i):
+                    record_component_errors("Vanilla", compute_component_errors(u_vanilla, u_exact_i, physics_rules_eval))
+                    mark_success("Vanilla", u_vanilla, res_vanilla, start_t, end_t)
+            except RuntimeError as exc:
+                if not deactivate_if_exception("Vanilla", exc, i):
+                    raise
 
         if method_active.get("PROFlow", False):
             start_t = time.time()
-            u_proflow = sampler.proflow_sample(u0_i, args.n_steps, hfunc, K=3, lr_base=0.1)
-            res_proflow = compute_physical_residual(u_proflow, eval_hfunc)
-            end_t = time.time()
-            if not deactivate_if_nan("PROFlow", res_proflow, i):
-                record_component_errors("PROFlow", compute_component_errors(u_proflow, u_exact_i, physics_rules_eval))
-                mark_success("PROFlow", u_proflow, res_proflow, start_t, end_t)
+            try:
+                u_proflow = sampler.proflow_sample(u0_i, args.n_steps, hfunc, K=3, lr_base=0.1)
+                res_proflow = compute_physical_residual(u_proflow, eval_hfunc)
+                end_t = time.time()
+                if not deactivate_if_nan("PROFlow", res_proflow, i):
+                    record_component_errors("PROFlow", compute_component_errors(u_proflow, u_exact_i, physics_rules_eval))
+                    mark_success("PROFlow", u_proflow, res_proflow, start_t, end_t)
+            except RuntimeError as exc:
+                if not deactivate_if_exception("PROFlow", exc, i):
+                    raise
 
         if method_active.get("PCFM", False):
             start_t = time.time()
-            u_pcfm_i = sampler.pcfm_sample(
-                u0_i,
-                args.n_steps,
-                hfunc=hfunc,
-                newtonsteps=1,
-                guided_interpolation=False,
-                interpolation_params={"custom_lam": 1.0, "step_size": 0.01, "num_steps": 20},
-            )
-            u_pcfm_final_32 = u_pcfm_i.detach()
-            u_flat_64 = u_pcfm_final_32.flatten().unsqueeze(0).to(torch.float64)
-            u_pcfm_final_proj = fast_project_batched(u_flat_64, hfunc, max_iter=2)
-            u_pcfm = u_pcfm_final_proj.view(u_pcfm_final_32.shape).to(torch.float32).detach()
+            try:
+                u_pcfm_i = sampler.pcfm_sample(
+                    u0_i,
+                    args.n_steps,
+                    hfunc=hfunc,
+                    newtonsteps=1,
+                    guided_interpolation=False,
+                    interpolation_params={"custom_lam": 1.0, "step_size": 0.01, "num_steps": 20},
+                )
+                u_pcfm_final_32 = u_pcfm_i.detach()
+                u_flat_64 = u_pcfm_final_32.flatten().unsqueeze(0).to(torch.float64)
+                u_pcfm_final_proj = fast_project_batched(u_flat_64, hfunc, max_iter=2)
+                u_pcfm = u_pcfm_final_proj.view(u_pcfm_final_32.shape).to(torch.float32).detach()
 
-            res_pcfm = compute_physical_residual(u_pcfm, hfunc)
-            end_t = time.time()
-            if not deactivate_if_nan("PCFM", res_pcfm, i):
-                record_component_errors("PCFM", compute_component_errors(u_pcfm, u_exact_i, physics_rules_eval))
-                mark_success("PCFM", u_pcfm, res_pcfm, start_t, end_t)
+                res_pcfm = compute_physical_residual(u_pcfm, hfunc)
+                end_t = time.time()
+                if not deactivate_if_nan("PCFM", res_pcfm, i):
+                    record_component_errors("PCFM", compute_component_errors(u_pcfm, u_exact_i, physics_rules_eval))
+                    mark_success("PCFM", u_pcfm, res_pcfm, start_t, end_t)
+            except RuntimeError as exc:
+                if not deactivate_if_exception("PCFM", exc, i):
+                    raise
 
         for g in args.gamma_list:
             tracker_key = f"Ours_g{g}"
             if method_active.get(tracker_key, False):
                 start_t = time.time()
-                u_ours, _ = sampler.continuous_guided_sample(
-                    u0_i,
-                    args.n_steps,
-                    hfunc,
-                    gamma_max=g,
-                    final_refinement=False,
-                    refinement_steps=1,
-                    refinement_lr=0.2,
-                )
-                res_ours = compute_physical_residual(u_ours, hfunc)
-                end_t = time.time()
-                if not deactivate_if_nan(tracker_key, res_ours, i):
-                    record_component_errors(tracker_key, compute_component_errors(u_ours, u_exact_i, physics_rules_eval))
-                    mark_success(tracker_key, u_ours, res_ours, start_t, end_t)
+                try:
+                    u_ours, _ = sampler.continuous_guided_sample(
+                        u0_i,
+                        args.n_steps,
+                        hfunc,
+                        gamma_max=g,
+                        final_refinement=False,
+                        refinement_steps=1,
+                        refinement_lr=0.2,
+                    )
+                    res_ours = compute_physical_residual(u_ours, hfunc)
+                    end_t = time.time()
+                    if not deactivate_if_nan(tracker_key, res_ours, i):
+                        record_component_errors(tracker_key, compute_component_errors(u_ours, u_exact_i, physics_rules_eval))
+                        mark_success(tracker_key, u_ours, res_ours, start_t, end_t)
+                except RuntimeError as exc:
+                    if not deactivate_if_exception(tracker_key, exc, i):
+                        raise
 
         if args.log_every > 0 and ((i + 1) % args.log_every == 0):
             print(f"[WandB] Periodic log at sample {i + 1}/{args.n_samples}")
@@ -522,6 +590,7 @@ def main():
         "Method",
         "Success Rate (%)",
         "Generated Samples",
+        "Status",
         "Speed (sec/sample)",
         "Physical Residual (MAE)",
         "IC Error",
@@ -542,6 +611,7 @@ def main():
         success_count = method_success_counts[name]
         success_rate = 100.0 * success_count / max(1, args.n_samples)
         failed_with_nan = method_failure_sample[name] is not None
+        status = get_method_status(name, args.n_samples)
 
         if (not failed_with_nan) and success_count == args.n_samples:
             tracker.print_summary()
@@ -584,7 +654,13 @@ def main():
             smse = np.nan
             sample_mse = np.nan
 
-            if failed_with_nan:
+            if status == "OOM":
+                print(f"\n--- {name} Summary ---")
+                print(
+                    f"Disabled at sample {method_failure_sample[name]}/{args.n_samples} "
+                    "due to OOM. Final quality metrics are set to NaN."
+                )
+            elif failed_with_nan:
                 print(f"\n--- {name} Summary ---")
                 print(
                     f"Disabled at sample {method_failure_sample[name]}/{args.n_samples} "
@@ -596,6 +672,8 @@ def main():
 
         wandb_log_dict[f"Success_Rate (%)/{name}"] = success_rate
         wandb_log_dict[f"Success_Samples/{name}"] = success_count
+        wandb_log_dict[f"Run_Status/{name}"] = status
+        wandb_log_dict[f"OOM_Flag/{name}"] = 1 if status == "OOM" else 0
         wandb_log_dict[f"Speed (sec/sample)/{name}"] = speed
         wandb_log_dict[f"Physics_Error (MAE)/{name}"] = residual
         wandb_log_dict[f"Physics_Error_IC/{name}"] = ce_ic
@@ -613,6 +691,7 @@ def main():
             name,
             success_rate,
             success_count,
+            status,
             speed,
             residual,
             ce_ic,
