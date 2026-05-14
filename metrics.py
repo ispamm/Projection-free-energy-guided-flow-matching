@@ -12,15 +12,15 @@ def compute_physical_residual(u_pred, hfunc):
     exactly as implemented in your original script.
     """
     with torch.no_grad():
-        # Flattening of the tensor for passing to hfunc,
-        # we calculate the absolute value and then the mean (MAE)
+        # Flatten tensor for `hfunc`; return mean absolute residual (MAE)
         residual = hfunc(u_pred.flatten())
         error = residual.abs().mean().item()
     return error
 
 def compute_ns_physical_residual(u_pred, f_i, nu=0.001, dx=1/64, dy=1/64, dt=1.0):
     """
-    Calcola il residuo della PDE assicurandosi che tutti i tensori siano sullo stesso device.
+    Compute the PDE residual, ensuring inputs and tensors are on the same device.
+    Returns the mean absolute residual over the interior grid points.
     """
     with torch.no_grad():
         
@@ -104,8 +104,8 @@ class MetricsTracker:
         self.samples = []
         
     def record_step(self, sample, residual_val, start_time, end_time, batch_size=1):
-        """Salva il campione, il residuo e calcola il tempo per campione."""
-        # Save the time divided by the sample processed in this step
+        """Store the sample and residual; record time per sample."""
+        # Record elapsed time per sample for this step
         self.times.append((end_time - start_time) / batch_size)
         self.residuals.append(residual_val)
         self.samples.append(sample.cpu())  # Move to CPU for later analysis if needed

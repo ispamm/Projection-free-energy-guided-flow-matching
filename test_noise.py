@@ -1,39 +1,106 @@
-import torch
+import numpy as np
 import matplotlib.pyplot as plt
 
-# Parametri griglia e kernel
-nx = 100
-x = torch.linspace(0, 1, nx)
-length_scale = 0.001
+# Impostazioni estetiche per paper
+plt.rcParams.update({'font.size': 14, 'font.family': 'serif'})
 
-# Costruiamo la matrice di covarianza (Matern nu=0.5 è l'Esponenziale)
-dist_matrix = torch.abs(x.unsqueeze(1) - x.unsqueeze(0))
-cov_matrix = torch.exp(-dist_matrix / length_scale)
+def compute_2d_points(N=50):
+    """Genera griglia di punti 2D standardizzata [0,1]x[0,1]"""
+    x = np.linspace(0, 1, N)
+    y = np.linspace(0, 1, N)
+    X, Y = np.meshgrid(x, y)
+    # Appiattisce i punti per il calcolo della matrice di covarianza (N^2, 2)
+    return np.vstack([X.ravel(), Y.ravel()]).T, X, Y, N
 
-# Generiamo un campione usando la decomposizione di Cholesky
-L = torch.linalg.cholesky(cov_matrix + 1e-6 * torch.eye(nx)) # 1e-6 per stabilità
-z = torch.randn(nx)
-matern_sample = L @ z
+def squared_exponential_kernel_2d(pts, length_scale):
+    """Calcola matrice di covarianza SE per punti 2D"""
+    # Calcolo robusto delle distanze euclidee quadrate
+    sqdist = np.sum(pts**2, 1).reshape(-1, 1) + np.sum(pts**2, 1) - 2 * np.dot(pts, pts.T)
+    # Assicura che non ci siano valori negativi infinitesimali per precisione numerica
+    sqdist = np.maximum(sqdist, 0)
+    return np.exp(-.5 * (1/length_scale**2) * sqdist)
 
-# Generiamo un campione di puro rumore bianco
-white_noise = torch.randn(nx)
+def matern_kernel_2d(pts, length_scale, nu=1.5):
+    """Calcola matrice di covarianza Matérn (nu=3/2) per punti 2D"""
+    sqdist = np.sum(pts**2, 1).reshape(-1, 1) + np.sum(pts**2, 1) - 2 * np.dot(pts, pts.T)
+    dist = np.sqrt(np.maximum(sqdist, 1e-12))
+    factor = np.sqrt(3) * dist / length_scale
+    return (1. + factor) * np.exp(-factor)
 
-# --- PLOT ---
-fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+def sample_grf(K):
+    """Campiona un campo gaussiano data la matrice K"""
+    N_total = K.shape[0]
+    jitter = 1e-5 * np.eye(N_total) # Stabilizzazione numerica per Cholesky
+    try:
+        L = np.linalg.cholesky(K + jitter)
+    except np.linalg.LinAlgError:
+        # Se fallisce, tenta un jitter leggermente più aggressivo
+        L = np.linalg.cholesky(K + 1e-4 * np.eye(N_total))
+    
+    z = np.random.normal(size=(N_total, 1))
+    return np.dot(L, z)
 
-# 1. Matrice di Covarianza
-im = axes[0].imshow(cov_matrix.numpy(), cmap='hot')
-axes[0].set_title("Covariance Matrix (Length=0.001)")
-plt.colorbar(im, ax=axes[0])
+# --- SETUP ---
+np.random.seed(123) # Seed per riproducibilità
+N_grid = 50 # Risoluzione della griglia visiva (50x50 = 2500 punti)
+pts, X_grid, Y_grid, _ = compute_2d_points(N=N_grid)
 
-# 2. Il loro "Matern"
-axes[1].plot(x.numpy(), matern_sample.numpy(), color='blue')
-axes[1].set_title("Matern Sample (nu=0.5, l=0.001)")
+print("Generazione campioni dei Prior 2D...")
 
-# 3. Puro White Noise
-axes[2].plot(x.numpy(), white_noise.numpy(), color='red')
-axes[2].set_title("Pure torch.randn()")
+# 1. White Noise Prior (Uncorrelated Gaussian)
+# Campioniamo direttamente senza covarianza per vero White Noise
+sample_white = np.random.normal(size=(N_grid, N_grid))
 
-plt.tight_layout()
-plt.savefig("noise_comparison.png")
-print("Grafico salvato in noise_comparison.png!")
+# 2. Matérn Prior (Heat Equation, l = 0.2)
+K_matern = matern_kernel_2d(pts, length_scale=0.2)
+sample_matern_flat = sample_grf(K_matern)
+sample_matern = sample_matern_flat.reshape(N_grid, N_grid)
+
+# 3. Squared Exponential Prior (RD/Burgers, l = 0.05)
+K_se = squared_exponential_kernel_2d(pts, length_scale=0.05)
+sample_se_flat = sample_grf(K_se)
+sample_se = sample_se_flat.reshape(N_grid, N_grid)
+
+# --- PLOTTING ---
+fig, axes = plt.subplots(1, 3, figsize=(18, 5), dpi=300)
+
+# Colormap per divergenza (RdBu_r è ottima per la fisica)
+cmap_style = 'RdBu_r'
+
+# Impostiamo vmin/vmax unificati per confronto onesto
+vmin_val = -3.0
+vmax_val = 3.0
+
+# a) White Noise
+im0 = axes[0].imshow(sample_white, cmap=cmap_style, vmin=vmin_val, vmax=vmax_val,
+                     origin='lower', extent=[0, 1, 0, 1], interpolation='nearest')
+axes[0].set_title("a) White Noise Prior\n(Uncorrelated Pixels)", fontweight='bold')
+axes[0].set_xlabel("Spatial $x$")
+axes[0].set_ylabel("Spatial $y$")
+
+# b) Matérn
+im1 = axes[1].imshow(sample_matern, cmap=cmap_style, vmin=vmin_val, vmax=vmax_val,
+                     origin='lower', extent=[0, 1, 0, 1], interpolation='bilinear')
+axes[1].set_title("b) Matérn Kernel Prior\n(Heat Eq, $\ell = 0.2$)", fontweight='bold')
+axes[1].set_xlabel("Spatial $x$")
+# axes[1].set_ylabel("Spatial $y$") # Nascondiamo per pulizia
+
+# c) Squared Exponential
+im2 = axes[2].imshow(sample_se, cmap=cmap_style, vmin=vmin_val, vmax=vmax_val,
+                     origin='lower', extent=[0, 1, 0, 1], interpolation='bilinear')
+axes[2].set_title("c) Squared Exponential Kernel\n(RD/Burgers Eq, $\ell = 0.05$)", fontweight='bold')
+axes[2].set_xlabel("Spatial $x$")
+# axes[2].set_ylabel("Spatial $y$") # Nascondiamo per pulizia
+
+# Rimuoviamo i tick Y interni per pulizia visiva
+axes[1].set_yticks([])
+axes[2].set_yticks([])
+
+# Aggiungiamo colorbar unificata
+fig.subplots_adjust(right=0.88)
+cbar_ax = fig.add_axes([0.90, 0.15, 0.015, 0.70]) # [left, bottom, width, height]
+cbar = fig.colorbar(im0, cax=cbar_ax)
+cbar.set_label("Amplitude $u_0(\\mathbf{x})$")
+
+plt.savefig("generative_priors_comparison_2d.pdf", format='pdf', bbox_inches='tight')
+print("Immagine salvata come generative_priors_comparison_2d.pdf")

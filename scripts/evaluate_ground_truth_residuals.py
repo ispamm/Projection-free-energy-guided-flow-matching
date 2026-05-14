@@ -197,11 +197,25 @@ def evaluate_burgers(cfg, dataset, n_samples, device):
     x_grid = torch.linspace(0.0, 1.0, nx, device=device)
     t_grid = torch.linspace(0.0, 1.0, nt, device=device)
     nu_default = 0.01
+    bc_values = None
+    n_bc = None
+    if hasattr(dataset, "file") and "bc" in dataset.file:
+        bc_values = torch.from_numpy(dataset.file["bc"][:]).to(device=device, dtype=torch.float32)
+        n_bc = int(bc_values.shape[0])
 
     acc = MeanAccumulator()
     for i in range(n_samples):
+        if n_bc is not None:
+            _, i_bc = divmod(i, n_bc)
+            left_bc = bc_values[i_bc]
+        else:
+            left_bc = None
+
         u_exact = dataset[i].to(device=device, dtype=torch.float32)
         u_flat = u_exact.flatten()
+
+        if left_bc is None:
+            left_bc = u_exact[0, 0]
 
         partial_rules = Residuals(
             data=u_exact.unsqueeze(0),
@@ -210,7 +224,7 @@ def evaluate_burgers(cfg, dataset, n_samples, device):
             nx=nx,
             nt=nt,
             nu=nu_default,
-            left_bc=u_exact[0, 0],
+            left_bc=left_bc,
         )
         full_rules = BurgersEquationResidualsFullPDE(data=u_exact, nx=nx, nt=nt, nu=nu_default)
         mass_rules = Residuals(
@@ -220,7 +234,7 @@ def evaluate_burgers(cfg, dataset, n_samples, device):
             nx=nx,
             nt=nt,
             nu=nu_default,
-            left_bc=u_exact[0, 0],
+            left_bc=left_bc,
         )
 
         metrics = OrderedDict()

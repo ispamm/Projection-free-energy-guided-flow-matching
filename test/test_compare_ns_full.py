@@ -1,8 +1,12 @@
 import os
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import re
 import argparse
 import time
 import random
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import h5py
 import matplotlib.pyplot as plt
@@ -18,7 +22,6 @@ from pcfm.pcfm_sampling import make_grid, fast_project_batched
 from pcfm.constraints import Residuals2D
 from metrics import (
     compute_physical_residual,
-    compute_ns_physical_residual,
     compute_distribution_metrics,
     compute_samplewise_mse,
     MetricsTracker,
@@ -51,6 +54,8 @@ def parse_args():
 
     # Ablation Parameters for "Ours"
     parser.add_argument("--gamma_list", nargs="+", type=float, default=[1.0], help="Ablation for gamma values. Es: --gamma_list 0.1 1.0 2.0")
+    parser.add_argument("--n_steps_list", nargs="+", type=int, default=[100], help="Ablation for flow-matching steps. Es: --n_steps_list 50 100 200")
+    parser.add_argument("--scheduler_list", nargs="+", type=str, default=["sine"], help="Ablation for scheduler types. Es: --scheduler_list sine linear cosine")
 
     return parser.parse_args()
 
@@ -96,7 +101,7 @@ def main():
     torch.manual_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
-    run_name = args.run_name if args.run_name else f"eval_partial_{args.n_samples}s_{args.n_steps}step"
+    run_name = args.run_name if args.run_name else f"eval_full_{args.n_samples}s_{args.n_steps}step"
 
     wandb.init(project="pcfm-physics-comparison", name=run_name, config=vars(args))
 
@@ -104,7 +109,7 @@ def main():
     config = load_config(args.config_path)
     cond_type = getattr(config, "cond_type", "ic")
     if cond_type != "ic":
-        raise NotImplementedError(f"Unsupported cond_type for ns partial: {cond_type}")
+        raise NotImplementedError(f"Unsupported cond_type for ns full: {cond_type}")
 
     print(f"Loading model and weights from {args.ckpt_path} to {device}...")
     model = get_flow_model(config.model, config.encoder).to(device)
@@ -146,7 +151,6 @@ def main():
 
     x_grid = torch.linspace(0.0, 1.0, actual_nx + 1, device=device)[:-1]
     y_grid = torch.linspace(0.0, 1.0, actual_ny + 1, device=device)[:-1]
-    # NS data is generated with T=49 and 50 recorded snapshots.
     t_grid = torch.linspace(0.0, 49.0, actual_nt, device=device)
 
     actual_dims = [actual_nx, actual_ny, actual_nt]
@@ -160,6 +164,7 @@ def main():
     method_active = {}
     method_success_counts = {}
     method_failure_sample = {}
+    method_failure_reason = {}
     method_component_sums = {}
 
     def mark_success(name, sample, residual, start_t, end_t):
@@ -170,12 +175,45 @@ def main():
         if not np.isfinite(residual):
             method_active[name] = False
             method_failure_sample[name] = sample_idx + 1
+            method_failure_reason[name] = "NAN_INF"
             print(
                 f"[DISABLE] {name} produced Physics_Error={residual} "
                 f"at sample {sample_idx + 1}/{args.n_samples}. Skipping it for remaining samples."
             )
             return True
         return False
+
+    def deactivate_if_exception(name, exc, sample_idx):
+        msg = str(exc)
+        msg_lower = msg.lower()
+        is_oom = (
+            isinstance(exc, torch.OutOfMemoryError)
+            or ("out of memory" in msg_lower)
+            or ("dense jacobian too large" in msg_lower)
+        )
+        if is_oom:
+            torch.cuda.empty_cache()
+            method_active[name] = False
+            method_failure_sample[name] = sample_idx + 1
+            method_failure_reason[name] = "OOM"
+            print(
+                f"[DISABLE] {name} hit OOM at sample {sample_idx + 1}/{args.n_samples}. "
+                "Skipping it for remaining samples."
+            )
+            return True
+        return False
+
+    def get_method_status(name, expected_samples):
+        reason = method_failure_reason[name]
+        if reason == "OOM":
+            return "OOM"
+        if reason == "NAN_INF":
+            return "NAN_INF"
+        if method_success_counts[name] == expected_samples:
+            return "OK"
+        if method_success_counts[name] > 0:
+            return "PARTIAL"
+        return "NOT_RUN"
 
     def log_periodic_metrics(processed_samples: int):
         if processed_samples <= 0:
@@ -197,6 +235,7 @@ def main():
                 "Method",
                 "Success Rate (%)",
                 "Generated Samples",
+                "Status",
                 "Speed (sec/sample)",
                 "Physical Residual (MAE)",
                 "IC Error",
@@ -217,6 +256,7 @@ def main():
             success_count = method_success_counts[name]
             success_rate = 100.0 * success_count / max(1, args.n_samples)
             failed_with_nan = method_failure_sample[name] is not None
+            status = get_method_status(name, args.n_samples)
 
             if (not failed_with_nan) and success_count == args.n_samples:
                 u_pred_all = tracker.get_all_samples_tensor()
@@ -261,11 +301,14 @@ def main():
             periodic_log[f"Periodic/PDE_Error_Scaled/{name}"] = ce_pde_scaled
             periodic_log[f"Periodic/PDE_Error_Raw/{name}"] = ce_pde_raw
             periodic_log[f"Periodic/Mass_Error/{name}"] = ce_mass
+            periodic_log[f"Periodic/Status/{name}"] = status
+            periodic_log[f"Periodic/OOM_Flag/{name}"] = 1 if status == "OOM" else 0
 
             periodic_table.add_data(
                 name,
                 success_rate,
                 success_count,
+                status,
                 speed,
                 residual,
                 ce_ic,
@@ -294,9 +337,26 @@ def main():
     if "all" in args.models or "pcfm" in args.models:
         trackers["PCFM"] = MetricsTracker("PCFM")
 
+    def get_ours_tracker_key(n_steps_value, gamma_value, scheduler_value=None):
+        if scheduler_value is None:
+            scheduler_value = args.scheduler_list[0] if hasattr(args, 'scheduler_list') else "sine"
+        if len(args.n_steps_list) == 1 and args.n_steps_list[0] == args.n_steps and len(args.scheduler_list) == 1 and args.scheduler_list[0] == scheduler_value:
+            return f"Ours_g{gamma_value}"
+        return f"Ours_s{n_steps_value}_g{gamma_value}_sch{scheduler_value}"
+
+    def get_ours_tracker_label(n_steps_value, gamma_value, scheduler_value=None):
+        if scheduler_value is None:
+            scheduler_value = args.scheduler_list[0] if hasattr(args, 'scheduler_list') else "sine"
+        if len(args.n_steps_list) == 1 and args.n_steps_list[0] == args.n_steps and len(args.scheduler_list) == 1 and args.scheduler_list[0] == scheduler_value:
+            return f"Ours (gamma={gamma_value}, sched={scheduler_value})"
+        return f"Ours (steps={n_steps_value}, gamma={gamma_value}, sched={scheduler_value})"
+
     if "all" in args.models or "ours" in args.models:
-        for g in args.gamma_list:
-            trackers[f"Ours_g{g}"] = MetricsTracker(f"Ours (gamma={g})")
+        for n_steps_value in args.n_steps_list:
+            for g in args.gamma_list:
+                for sched in args.scheduler_list:
+                    tracker_key = get_ours_tracker_key(n_steps_value, g, sched)
+                    trackers[tracker_key] = MetricsTracker(get_ours_tracker_label(n_steps_value, g, sched))
 
     if "all" in args.models or "eci" in args.models:
         trackers["ECI"] = MetricsTracker("ECI")
@@ -311,6 +371,7 @@ def main():
         method_active[method_name] = True
         method_success_counts[method_name] = 0
         method_failure_sample[method_name] = None
+        method_failure_reason[method_name] = None
         method_component_sums[method_name] = {
             "ic": 0.0,
             "bc_left": 0.0,
@@ -323,7 +384,6 @@ def main():
 
     def compute_component_errors(u_pred, u_true, physics_rules_eval):
         u_pred_flat = u_pred.flatten()
-        u_true_flat = u_true.flatten()
 
         ic_error = torch.nn.functional.mse_loss(u_pred[:, :, :, 0], u_true[:, :, :, 0]).item()
 
@@ -352,14 +412,10 @@ def main():
     def get_component_means(name, denom):
         return {key: value / max(1, denom) for key, value in method_component_sums[name].items()}
 
-    dx_val = (x_grid[1] - x_grid[0]).item()
-    dy_val = (y_grid[1] - y_grid[0]).item()
-    dt_val = (t_grid[1] - t_grid[0]).item()
-
     print("5. Start Inference Loop...")
     for i in range(args.n_samples):
         if not any(method_active.values()):
-            print("\n[EARLY STOP] All methods disabled due to NaN/Inf Physics_Error.")
+            print("\n[EARLY STOP] All methods disabled (OOM and/or NaN/Inf).")
             break
 
         if i % 10 == 0:
@@ -371,21 +427,7 @@ def main():
         nf_unique = f_all.shape[0]
         f_i = f_all[i % nf_unique].to(device)
 
-        # Partial guidance: original constraints residual (IC + mass) from constraints.py
-        physics_rules_guidance = Residuals2D(
-            data=u_exact_i,
-            x=x_grid,
-            y=y_grid,
-            t_grid=t_grid,
-            nx=actual_nx,
-            ny=actual_ny,
-            nt=actual_nt,
-            nu=nu_default,
-            rho=1.0,
-        )
-
-        # Eval residual: full NS residual for richer diagnostics/metrics.
-        physics_rules_eval = NavierStokesResidualsFullPDE(
+        physics_rules_guidance = NavierStokesResidualsFullPDE(
             data=u_exact_i,
             forcing=f_i,
             nx=actual_nx,
@@ -397,13 +439,25 @@ def main():
             t_grid=t_grid,
         )
 
-        def hfunc(u_flat):
-            return physics_rules_guidance.full_residual_ns(u_flat)
+        # Residuals2D mass kept available only as cross-check for diagnostics if needed.
+        _ = Residuals2D(
+            data=u_exact_i,
+            x=x_grid,
+            y=y_grid,
+            t_grid=t_grid,
+            nx=actual_nx,
+            ny=actual_ny,
+            nt=actual_nt,
+            nu=nu_default,
+            rho=1.0,
+        )
 
+        physics_rules_eval = physics_rules_guidance
+        hfunc = physics_rules_guidance
         eval_hfunc = hfunc
 
-        ic_err = physics_rules_guidance.ic_residual_ns(u_exact_i.flatten()).abs().mean().item()
-        mass_err = physics_rules_guidance.mass_residual_ns(u_exact_i.flatten())[1:].abs().mean().item()
+        ic_err = physics_rules_guidance.ic_residual(u_exact_i.flatten()).abs().mean().item()
+        mass_err = physics_rules_guidance.mass_residual(u_exact_i.flatten())[1:].abs().mean().item()
         pde_err = physics_rules_eval.pde_residual(u_exact_i.flatten()).abs().mean().item()
         print(f"Sanity Check -> IC: {ic_err:.5f} | Mass: {mass_err:.5f} | PDE: {pde_err:.5f}")
 
@@ -421,103 +475,134 @@ def main():
 
         if method_active.get("ECI", False):
             start_t = time.time()
-            u_eci = sampler.eci_sample(u0_i, args.n_steps, n_mix=5, resample_step=5, constraint=constraint)
-            res_eci = compute_physical_residual(u_eci, eval_hfunc)
-            end_t = time.time()
-            if not deactivate_if_nan("ECI", res_eci, i):
-                record_component_errors("ECI", compute_component_errors(u_eci, u_exact_i, physics_rules_eval))
-                mark_success("ECI", u_eci, res_eci, start_t, end_t)
+            try:
+                u_eci = sampler.eci_sample(u0_i, args.n_steps, n_mix=5, resample_step=5, constraint=constraint)
+                res_eci = compute_physical_residual(u_eci, eval_hfunc)
+                end_t = time.time()
+                if not deactivate_if_nan("ECI", res_eci, i):
+                    record_component_errors("ECI", compute_component_errors(u_eci, u_exact_i, physics_rules_eval))
+                    mark_success("ECI", u_eci, res_eci, start_t, end_t)
+            except RuntimeError as exc:
+                if not deactivate_if_exception("ECI", exc, i):
+                    raise
 
         if method_active.get("DiffusionPDE", False):
             start_t = time.time()
-            u_diffpde = sampler.guided_sample(
-                u0_i,
-                u_exact_i,
-                mask_float,
-                args.n_steps,
-                loss_fn=composite_loss_fn,
-                eta=0.01,
-            )
-            res_diffpde = compute_physical_residual(u_diffpde, eval_hfunc)
-            end_t = time.time()
-            if not deactivate_if_nan("DiffusionPDE", res_diffpde, i):
-                record_component_errors("DiffusionPDE", compute_component_errors(u_diffpde, u_exact_i, physics_rules_eval))
-                mark_success("DiffusionPDE", u_diffpde, res_diffpde, start_t, end_t)
+            try:
+                u_diffpde = sampler.guided_sample(
+                    u0_i,
+                    u_exact_i,
+                    mask_float,
+                    args.n_steps,
+                    loss_fn=composite_loss_fn,
+                    eta=0.01,
+                )
+                res_diffpde = compute_physical_residual(u_diffpde, eval_hfunc)
+                end_t = time.time()
+                if not deactivate_if_nan("DiffusionPDE", res_diffpde, i):
+                    record_component_errors("DiffusionPDE", compute_component_errors(u_diffpde, u_exact_i, physics_rules_eval))
+                    mark_success("DiffusionPDE", u_diffpde, res_diffpde, start_t, end_t)
+            except RuntimeError as exc:
+                if not deactivate_if_exception("DiffusionPDE", exc, i):
+                    raise
 
         if method_active.get("DFlow", False):
             start_t = time.time()
-            u_dflow = sampler.dflow_ns_sample(
-                u_exact_i,
-                mask_float,
-                n_sample=1,
-                n_step=args.n_steps,
-                n_iter=10,
-                lr=0.01,
-                loss_fn=composite_loss_fn,
-            )
-            res_dflow = compute_physical_residual(u_dflow, eval_hfunc)
-            end_t = time.time()
-            if not deactivate_if_nan("DFlow", res_dflow, i):
-                record_component_errors("DFlow", compute_component_errors(u_dflow, u_exact_i, physics_rules_eval))
-                mark_success("DFlow", u_dflow, res_dflow, start_t, end_t)
+            try:
+                u_dflow = sampler.dflow_ns_sample(
+                    u_exact_i,
+                    mask_float,
+                    n_sample=1,
+                    n_step=args.n_steps,
+                    n_iter=10,
+                    lr=0.01,
+                    loss_fn=composite_loss_fn,
+                )
+                res_dflow = compute_physical_residual(u_dflow, eval_hfunc)
+                end_t = time.time()
+                if not deactivate_if_nan("DFlow", res_dflow, i):
+                    record_component_errors("DFlow", compute_component_errors(u_dflow, u_exact_i, physics_rules_eval))
+                    mark_success("DFlow", u_dflow, res_dflow, start_t, end_t)
+            except RuntimeError as exc:
+                if not deactivate_if_exception("DFlow", exc, i):
+                    raise
 
         if method_active.get("Vanilla", False):
             start_t = time.time()
-            u_vanilla = sampler.vanilla_sample(u0_i, args.n_steps)
-            res_vanilla = compute_physical_residual(u_vanilla, eval_hfunc)
-            end_t = time.time()
-            if not deactivate_if_nan("Vanilla", res_vanilla, i):
-                record_component_errors("Vanilla", compute_component_errors(u_vanilla, u_exact_i, physics_rules_eval))
-                mark_success("Vanilla", u_vanilla, res_vanilla, start_t, end_t)
+            try:
+                u_vanilla = sampler.vanilla_sample(u0_i, args.n_steps)
+                res_vanilla = compute_physical_residual(u_vanilla, eval_hfunc)
+                end_t = time.time()
+                if not deactivate_if_nan("Vanilla", res_vanilla, i):
+                    record_component_errors("Vanilla", compute_component_errors(u_vanilla, u_exact_i, physics_rules_eval))
+                    mark_success("Vanilla", u_vanilla, res_vanilla, start_t, end_t)
+            except RuntimeError as exc:
+                if not deactivate_if_exception("Vanilla", exc, i):
+                    raise
 
         if method_active.get("PROFlow", False):
             start_t = time.time()
-            u_proflow = sampler.proflow_sample(u0_i, args.n_steps, hfunc, K=3, lr_base=0.1)
-            res_proflow = compute_physical_residual(u_proflow, eval_hfunc)
-            end_t = time.time()
-            if not deactivate_if_nan("PROFlow", res_proflow, i):
-                record_component_errors("PROFlow", compute_component_errors(u_proflow, u_exact_i, physics_rules_eval))
-                mark_success("PROFlow", u_proflow, res_proflow, start_t, end_t)
+            try:
+                u_proflow = sampler.proflow_sample(u0_i, args.n_steps, hfunc, K=3, lr_base=0.1)
+                res_proflow = compute_physical_residual(u_proflow, eval_hfunc)
+                end_t = time.time()
+                if not deactivate_if_nan("PROFlow", res_proflow, i):
+                    record_component_errors("PROFlow", compute_component_errors(u_proflow, u_exact_i, physics_rules_eval))
+                    mark_success("PROFlow", u_proflow, res_proflow, start_t, end_t)
+            except RuntimeError as exc:
+                if not deactivate_if_exception("PROFlow", exc, i):
+                    raise
 
         if method_active.get("PCFM", False):
             start_t = time.time()
-            u_pcfm_i = sampler.pcfm_sample(
-                u0_i,
-                args.n_steps,
-                hfunc=hfunc,
-                newtonsteps=1,
-                guided_interpolation=False,
-                interpolation_params={"custom_lam": 1.0, "step_size": 0.01, "num_steps": 20},
-            )
-            u_pcfm_final_32 = u_pcfm_i.detach()
-            u_flat_64 = u_pcfm_final_32.flatten().unsqueeze(0).to(torch.float64)
-            u_pcfm_final_proj = fast_project_batched(u_flat_64, hfunc, max_iter=2)
-            u_pcfm = u_pcfm_final_proj.view(u_pcfm_final_32.shape).to(torch.float32).detach()
-
-            res_pcfm = compute_physical_residual(u_pcfm, hfunc)
-            end_t = time.time()
-            if not deactivate_if_nan("PCFM", res_pcfm, i):
-                record_component_errors("PCFM", compute_component_errors(u_pcfm, u_exact_i, physics_rules_eval))
-                mark_success("PCFM", u_pcfm, res_pcfm, start_t, end_t)
-
-        for g in args.gamma_list:
-            tracker_key = f"Ours_g{g}"
-            if method_active.get(tracker_key, False):
-                start_t = time.time()
-                u_ours, _ = sampler.continuous_guided_sample(
+            try:
+                u_pcfm_i = sampler.pcfm_sample(
                     u0_i,
                     args.n_steps,
-                    hfunc,
-                    gamma_max=g,
-                    final_refinement=False,
-                    refinement_steps=1,
-                    refinement_lr=0.2,
+                    hfunc=hfunc,
+                    newtonsteps=1,
+                    guided_interpolation=False,
+                    interpolation_params={"custom_lam": 1.0, "step_size": 0.01, "num_steps": 20},
                 )
-                res_ours = compute_physical_residual(u_ours, hfunc)
+                u_pcfm_final_32 = u_pcfm_i.detach()
+                u_flat_64 = u_pcfm_final_32.flatten().unsqueeze(0).to(torch.float64)
+                u_pcfm_final_proj = fast_project_batched(u_flat_64, hfunc, max_iter=2)
+                u_pcfm = u_pcfm_final_proj.view(u_pcfm_final_32.shape).to(torch.float32).detach()
+
+                res_pcfm = compute_physical_residual(u_pcfm, hfunc)
                 end_t = time.time()
-                if not deactivate_if_nan(tracker_key, res_ours, i):
-                    record_component_errors(tracker_key, compute_component_errors(u_ours, u_exact_i, physics_rules_eval))
-                    mark_success(tracker_key, u_ours, res_ours, start_t, end_t)
+                if not deactivate_if_nan("PCFM", res_pcfm, i):
+                    record_component_errors("PCFM", compute_component_errors(u_pcfm, u_exact_i, physics_rules_eval))
+                    mark_success("PCFM", u_pcfm, res_pcfm, start_t, end_t)
+            except RuntimeError as exc:
+                if not deactivate_if_exception("PCFM", exc, i):
+                    raise
+
+        for n_steps_value in args.n_steps_list:
+            for g in args.gamma_list:
+                for sched in args.scheduler_list:
+                    tracker_key = get_ours_tracker_key(n_steps_value, g, sched)
+                    if method_active.get(tracker_key, False):
+                        start_t = time.time()
+                        try:
+                            u_ours, _ = sampler.continuous_guided_sample(
+                                u0_i,
+                                n_steps_value,
+                                hfunc,
+                                gamma_max=g,
+                                final_refinement=False,
+                                refinement_steps=100,
+                                refinement_lr=0.1,
+                                gamma_schedule=sched,
+                            )
+                            res_ours = compute_physical_residual(u_ours, hfunc)
+                            end_t = time.time()
+                            if not deactivate_if_nan(tracker_key, res_ours, i):
+                                record_component_errors(tracker_key, compute_component_errors(u_ours, u_exact_i, physics_rules_eval))
+                                mark_success(tracker_key, u_ours, res_ours, start_t, end_t)
+                        except RuntimeError as exc:
+                            if not deactivate_if_exception(tracker_key, exc, i):
+                                raise
 
         if args.log_every > 0 and ((i + 1) % args.log_every == 0):
             print(f"[WandB] Periodic log at sample {i + 1}/{args.n_samples}")
@@ -531,6 +616,7 @@ def main():
         "Method",
         "Success Rate (%)",
         "Generated Samples",
+        "Status",
         "Speed (sec/sample)",
         "Physical Residual (MAE)",
         "IC Error",
@@ -551,6 +637,7 @@ def main():
         success_count = method_success_counts[name]
         success_rate = 100.0 * success_count / max(1, args.n_samples)
         failed_with_nan = method_failure_sample[name] is not None
+        status = get_method_status(name, args.n_samples)
 
         if (not failed_with_nan) and success_count == args.n_samples:
             tracker.print_summary()
@@ -574,10 +661,6 @@ def main():
             sample_mse = compute_samplewise_mse(u_pred_all, u_exact_ref)
             speed = tracker.get_average_speed()
             residual = tracker.get_average_residual()
-
-            save_dir = f"results/{run_name}"
-            os.makedirs(save_dir, exist_ok=True)
-            torch.save(u_pred_all.cpu(), os.path.join(save_dir, f"{name}_tensors.pt"))
         else:
             speed = np.nan
             residual = np.nan
@@ -593,7 +676,13 @@ def main():
             smse = np.nan
             sample_mse = np.nan
 
-            if failed_with_nan:
+            if status == "OOM":
+                print(f"\n--- {name} Summary ---")
+                print(
+                    f"Disabled at sample {method_failure_sample[name]}/{args.n_samples} "
+                    "due to OOM. Final quality metrics are set to NaN."
+                )
+            elif failed_with_nan:
                 print(f"\n--- {name} Summary ---")
                 print(
                     f"Disabled at sample {method_failure_sample[name]}/{args.n_samples} "
@@ -603,8 +692,20 @@ def main():
                 print(f"\n--- {name} Summary ---")
                 print("Evaluation did not complete on the full sample set. Final quality metrics are set to NaN.")
 
+        if method_success_counts[name] > 0:
+            if (not failed_with_nan) and success_count == args.n_samples:
+                save_tensor = u_pred_all
+            else:
+                save_tensor = tracker.get_all_samples_tensor()
+
+            save_dir = f"results/{run_name}"
+            os.makedirs(save_dir, exist_ok=True)
+            torch.save(save_tensor.cpu(), os.path.join(save_dir, f"{name}_tensors.pt"))
+
         wandb_log_dict[f"Success_Rate (%)/{name}"] = success_rate
         wandb_log_dict[f"Success_Samples/{name}"] = success_count
+        wandb_log_dict[f"Run_Status/{name}"] = status
+        wandb_log_dict[f"OOM_Flag/{name}"] = 1 if status == "OOM" else 0
         wandb_log_dict[f"Speed (sec/sample)/{name}"] = speed
         wandb_log_dict[f"Physics_Error (MAE)/{name}"] = residual
         wandb_log_dict[f"Physics_Error_IC/{name}"] = ce_ic
@@ -622,6 +723,7 @@ def main():
             name,
             success_rate,
             success_count,
+            status,
             speed,
             residual,
             ce_ic,

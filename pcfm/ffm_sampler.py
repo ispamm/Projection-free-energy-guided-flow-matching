@@ -13,11 +13,19 @@ from .pcfm_sampling import make_grid, pcfm_batched, pcfm_2d_batched
 
 
 def _compute_gamma_t(gamma_max, t_scalar, gamma_schedule):
-    if gamma_schedule == 'parabolic':
+    # Normalize schedule name to be case-insensitive
+    sched = str(gamma_schedule).lower()
+    if sched == 'parabolic':
         return gamma_max * (t_scalar ** 2)
-    if gamma_schedule == 'sine':
-        return gamma_max * math.sin(math.pi * t_scalar)   
-    raise ValueError(f"Unsupported gamma_schedule '{gamma_schedule}'. Use 'parabolic' or 'sine'.")
+    if sched == 'sine':
+        return gamma_max * math.sin(math.pi * t_scalar)
+    if sched == 'constant':
+        return gamma_max
+    if sched == 'linear':
+        return gamma_max * t_scalar
+    if sched == 'cosine':
+        return gamma_max * (1 - math.cos(math.pi * t_scalar)) / 2
+    raise ValueError(f"Unsupported gamma_schedule '{gamma_schedule}'. Supported: parabolic, sine, constant, linear, cosine.")
 
 
 class FFM_sampler:
@@ -57,19 +65,15 @@ class FFM_sampler:
         u = u0.clone()
         ts = torch.linspace(0, 1, n_step + 1, device=u0.device)
         
-        # Add fresh noise
+        
         grid = make_grid(u.shape[-2:], u.device)
 
         for t in tqdm(ts[:-1], desc="PROFlow sampling"):
             # 1. Velocity Field evaluation
             vf = self.model(t, u)
             
-            # 2. Prediction of the terminal field u_1_hat (Forward Shooting)
-            # Given that u_t = (1-t)u_0 + t*u_1, then u_1 = u_t + (1-t)*v_t
             u_1_hat = u + (1 - t) * vf
             
-            # 3. PROXIMAL UPDATES with learning rate scheduler
-            # The paper states that lr scales with (1-t)
             lr_t = lr_base * (1.0 - t.item())
             
             u_1_refined = u_1_hat.detach().requires_grad_(True)
@@ -85,11 +89,8 @@ class FFM_sampler:
             
             u_1_refined = u_1_refined.detach()
 
-            # 4. RE-INTERPOLATION 
-            # u_t' = (1-t')*epsilon + t'*u_1_refined
             t_next = t + dt
             if t_next < 1.0:
-                # The paper specifies 'fresh noise epsilon ~ N(0,I)'
                 epsilon = self.gp.sample(grid, u.shape[-2:], n_samples=u.shape[0])
                 u = (1 - t_next) * epsilon + t_next * u_1_refined
             else:
@@ -130,7 +131,6 @@ class FFM_sampler:
             if track_energy:
                 energy_history.append(energy.item())
             
-            # 1. Calcola il gradiente grezzo
             grad_E = torch.autograd.grad(energy, u)[0]
             
             # --- GRADIENT CLIPPING ---
@@ -217,7 +217,7 @@ class FFM_sampler:
             torch.cuda.empty_cache()
         return u.detach()
 
-    #
+    
     def dflow_sample(self, u1_true, mask, n_sample, n_step, n_iter=20, lr=1e-1, loss_fn=None):
         """
         D-Flow: optimizes the noise by differentiating through the flow matching ODE steps 
@@ -341,7 +341,7 @@ class FFM_NS_sampler:
     def __init__(self, model):
         self.model = model
 
-    # our method, PCFM
+    # PCFM
     def pcfm_sample(self, u0, n_step, hfunc, mode='root', newtonsteps=1, eps=1e-6,
                     guided_interpolation=True, interpolation_params={}):
         dt = 1.0 / n_step
@@ -486,7 +486,7 @@ class FFM_NS_sampler:
         mask = mask.to(device)
         grid = make_grid(u1_true.size()[1:], device)
 
-        noise = torch.randn_like(u1_true) # randn for NS 
+        noise = torch.randn_like(u1_true) 
         noise.requires_grad_(True)
         ts = torch.linspace(0, 1, n_step + 1, device=device)
         
