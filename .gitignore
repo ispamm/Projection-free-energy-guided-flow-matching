@@ -227,6 +227,9 @@ logs/
 results/
 .cursorignore
 .cursorindexingignore
+!assets/*.png
+!assets/*.jpg
+!assets/*.jpeg
 
 # Marimo
 marimo/_static/
