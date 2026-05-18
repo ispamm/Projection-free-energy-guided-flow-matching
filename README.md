@@ -178,9 +178,4 @@ If you use this repository or find our work helpful, please cite the original PC
   journal={Submitted to NeurIPS 2026},
   year={2026}
 }
-
-```
-
-```
-
 ```
