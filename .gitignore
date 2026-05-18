@@ -212,6 +212,7 @@ cython_debug/
 *.ps
 ablation_*.csv
 ablation_plots.py
+fix_images.py
 ablation_*_plots.py
 burgers_*_full.csv
 draw_schedulers.py

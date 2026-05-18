@@ -1,13 +1,12 @@
 # Energy-Guided Transport for Projection-Free Physics-Informed Flow Matching
 
-<div align="center" style="background-color: #ffffff; padding: 10px; border-radius: 8px; margin: 20px 0;">
-  <img src="assets/teaser_a-1.png" width="35%" alt="Explicit Hard Projections" style="display: inline-block;">
-  <img src="assets/teaser_b-1.png" width="35%" alt="EGT-FFM (Ours)" style="display: inline-block;">
+<div align="center">
+  <img src="assets/teaser_combined.png" width="85%" alt="Conceptual comparison of generative probability flows">
   <br><br>
-  <p style="color: #333333; font-family: serif; font-size: 14px; max-width: 90%; text-align: justify; margin: 0 auto;">
-    <strong>Conceptual comparison of generative probability flows.</strong> 
+  <p>
+    <em><strong>Conceptual comparison of generative probability flows.</strong> 
     (Left) Rigid algebraic projections interrupt the continuous integration. 
-    (Right) Our dissipative guidance smoothly steers the trajectory along the data manifold towards the physical equilibrium.
+    (Right) Our dissipative guidance smoothly steers the trajectory along the data manifold towards the physical equilibrium.</em>
   </p>
 </div>
 
@@ -114,31 +113,23 @@ The scripts will automatically log the results (physical errors, distributional 
 ## Qualitative Results
 
 ### 1D Burgers' Equation
-*Comparison of generated spatiotemporal velocity fields under different configurations.*
+*Comparison of generated spatiotemporal fields under different configurations.*
 
 #### White Noise Prior
-* **Partial Guidance (BC/IC only)**
-  <div align="center" style="background-color: #ffffff; padding: 20px; border-radius: 8px; margin: 15px 0;">
-    <img src="assets/burgers_white_partial-1.png" width="100%">
-  </div>
+* **Partial Guidance**
+  ![Burgers White Partial](assets/burgers_white_partial-1.png)
 
-* **Full-PDE Guidance (Stress Test)**
-  <div align="center" style="background-color: #ffffff; padding: 20px; border-radius: 8px; margin: 15px 0;">
-    <img src="assets/burgers_white_full-1.png" width="100%">
-  </div>
+* **Full-PDE Guidance**
+  ![Burgers White Full](assets/burgers_white_full-1.png)
 
 ---
 
 #### Smooth Kernel Prior
-* **Partial Guidance (BC/IC only)**
-  <div align="center" style="background-color: #ffffff; padding: 20px; border-radius: 8px; margin: 15px 0;">
-    <img src="assets/burgers_smooth_partial-1.png" width="100%">
-  </div>
+* **Partial Guidance**
+  ![Burgers Smooth Partial](assets/burgers_smooth_partial-1.png)
 
-* **Full-PDE Guidance (Stress Test)**
-  <div align="center" style="background-color: #ffffff; padding: 20px; border-radius: 8px; margin: 15px 0;">
-    <img src="assets/burgers_smooth_full-1.png" width="100%">
-  </div>
+* **Full-PDE Guidance**
+  ![Burgers Smooth Full](assets/burgers_smooth_full-1.png)
 
 <br>
 
@@ -146,28 +137,20 @@ The scripts will automatically log the results (physical errors, distributional 
 *Comparison of generated concentration fields under different configurations.*
 
 #### White Noise Prior
-* **Partial Guidance (BC/IC only)**
-  <div align="center" style="background-color: #ffffff; padding: 20px; border-radius: 8px; margin: 15px 0;">
-    <img src="assets/rd1d_white_partial-1.png" width="100%">
-  </div>
+* **Partial Guidance**
+  ![RD1D White Partial](assets/rd1d_white_partial-1.png)
 
-* **Full-PDE Guidance (Stress Test)**
-  <div align="center" style="background-color: #ffffff; padding: 20px; border-radius: 8px; margin: 15px 0;">
-    <img src="assets/rd1d_white_full-1.png" width="100%">
-  </div>
+* **Full-PDE Guidance**
+  ![RD1D White Full](assets/rd1d_white_full-1.png)
 
 ---
 
 #### Smooth Kernel Prior
-* **Partial Guidance (BC/IC only)**
-  <div align="center" style="background-color: #ffffff; padding: 20px; border-radius: 8px; margin: 15px 0;">
-    <img src="assets/rd1d_smooth_partial-1.png" width="100%">
-  </div>
+* **Partial Guidance**
+  ![RD1D Smooth Partial](assets/rd1d_smooth_partial-1.png)
 
-* **Full-PDE Guidance (Stress Test)**
-  <div align="center" style="background-color: #ffffff; padding: 20px; border-radius: 8px; margin: 15px 0;">
-    <img src="assets/rd1d_smooth_full-1.png" width="100%">
-  </div>
+* **Full-PDE Guidance**
+  ![RD1D Smooth Full](assets/rd1d_smooth_full-1.png)
 ---
 
 ## License and Acknowledgements
