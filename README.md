@@ -2,7 +2,7 @@
 
 This repository contains the official code for the paper **Energy-Guided Transport for Projection-Free Physics-Informed Flow Matching**.
 
-This project is built on top of the original **PCFM (Physics-Constrained Flow Matching)** repository. We have extended their codebase to implement our novel zero-shot framework (EGT), which formulates non-linear physical constraints as a continuous energy landscape. This approach ensures stable and efficient generation without the structural disruptions caused by rigid algebraic projections.
+This project is built on top of the original **PCFM (Physics-Constrained Flow Matching)** repository. We have extended their codebase to implement our novel zero-shot framework (EGT), which formulates non-linear physical constraints as a continuous energy landscape. This approach ensures stable and efficient generation without using rigid algebraic projections.
 
 ---
 
@@ -14,13 +14,6 @@ We recommend using `conda` to manage dependencies. You can create and activate t
 conda create -n egt python=3.10 -y
 conda activate egt
 pip install -r requirements.txt
-
-```
-
-If the environment already exists, simply activate it:
-
-```bash
-conda activate egt
 
 ```
 
@@ -100,18 +93,6 @@ python test/test_compare_burgers_full.py \
     --ckpt_path logs/burgers1d_white/latest.pt \
     --n_samples 100 \
     --models all \
-    --device cuda:0
-
-```
-
-**Test on Navier-Stokes 2D running ONLY the proposed method:**
-
-```bash
-python test/test_compare_ns_full.py \
-    --config_path configs/ns_lightning_white.yml \
-    --ckpt_path logs/ns_lightning_white/latest.pt \
-    --n_samples 100 \
-    --models ours \
     --device cuda:0
 
 ```
