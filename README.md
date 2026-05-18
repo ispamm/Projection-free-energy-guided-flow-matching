@@ -1,5 +1,16 @@
 # Energy-Guided Transport for Projection-Free Physics-Informed Flow Matching
 
+<div align="center" style="background-color: #ffffff; padding: 10px; border-radius: 8px; margin: 20px 0;">
+  <img src="assets/teaser_a-1.png" width="35%" alt="Explicit Hard Projections" style="display: inline-block;">
+  <img src="assets/teaser_b-1.png" width="35%" alt="EGT-FFM (Ours)" style="display: inline-block;">
+  <br><br>
+  <p style="color: #333333; font-family: serif; font-size: 14px; max-width: 90%; text-align: justify; margin: 0 auto;">
+    <strong>Conceptual comparison of generative probability flows.</strong> 
+    (Left) Rigid algebraic projections interrupt the continuous integration. 
+    (Right) Our dissipative guidance smoothly steers the trajectory along the data manifold towards the physical equilibrium.
+  </p>
+</div>
+
 This repository contains the official code for the paper **Energy-Guided Transport for Projection-Free Physics-Informed Flow Matching**.
 
 This project is built on top of the original **PCFM (Physics-Constrained Flow Matching)** repository. We have extended their codebase to implement our novel zero-shot framework (EGT), which formulates non-linear physical constraints as a continuous energy landscape. This approach ensures stable and efficient generation without using rigid algebraic projections.
@@ -99,6 +110,64 @@ python test/test_compare_burgers_full.py \
 
 The scripts will automatically log the results (physical errors, distributional fidelity, etc.) to WandB and output a summary report.
 
+
+## Qualitative Results
+
+### 1D Burgers' Equation
+*Comparison of generated spatiotemporal velocity fields under different configurations.*
+
+#### White Noise Prior
+* **Partial Guidance (BC/IC only)**
+  <div align="center" style="background-color: #ffffff; padding: 20px; border-radius: 8px; margin: 15px 0;">
+    <img src="assets/burgers_white_partial-1.png" width="100%">
+  </div>
+
+* **Full-PDE Guidance (Stress Test)**
+  <div align="center" style="background-color: #ffffff; padding: 20px; border-radius: 8px; margin: 15px 0;">
+    <img src="assets/burgers_white_full-1.png" width="100%">
+  </div>
+
+---
+
+#### Smooth Kernel Prior
+* **Partial Guidance (BC/IC only)**
+  <div align="center" style="background-color: #ffffff; padding: 20px; border-radius: 8px; margin: 15px 0;">
+    <img src="assets/burgers_smooth_partial-1.png" width="100%">
+  </div>
+
+* **Full-PDE Guidance (Stress Test)**
+  <div align="center" style="background-color: #ffffff; padding: 20px; border-radius: 8px; margin: 15px 0;">
+    <img src="assets/burgers_smooth_full-1.png" width="100%">
+  </div>
+
+<br>
+
+### 1D Reaction-Diffusion Equation
+*Comparison of generated concentration fields under different configurations.*
+
+#### White Noise Prior
+* **Partial Guidance (BC/IC only)**
+  <div align="center" style="background-color: #ffffff; padding: 20px; border-radius: 8px; margin: 15px 0;">
+    <img src="assets/rd1d_white_partial-1.png" width="100%">
+  </div>
+
+* **Full-PDE Guidance (Stress Test)**
+  <div align="center" style="background-color: #ffffff; padding: 20px; border-radius: 8px; margin: 15px 0;">
+    <img src="assets/rd1d_white_full-1.png" width="100%">
+  </div>
+
+---
+
+#### Smooth Kernel Prior
+* **Partial Guidance (BC/IC only)**
+  <div align="center" style="background-color: #ffffff; padding: 20px; border-radius: 8px; margin: 15px 0;">
+    <img src="assets/rd1d_smooth_partial-1.png" width="100%">
+  </div>
+
+* **Full-PDE Guidance (Stress Test)**
+  <div align="center" style="background-color: #ffffff; padding: 20px; border-radius: 8px; margin: 15px 0;">
+    <img src="assets/rd1d_smooth_full-1.png" width="100%">
+  </div>
 ---
 
 ## License and Acknowledgements
