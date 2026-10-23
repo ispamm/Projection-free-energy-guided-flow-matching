@@ -172,10 +172,10 @@ If you use this repository or find our work helpful, please cite the original PC
   year={2025}
 }
 
-@article{EGT2026,
+@inproceedings{galadini2026energy,
   title={Energy-Guided Transport for Projection-Free Physics-Informed Flow Matching},
-  author={Anonymous},
-  journal={Submitted to NeurIPS 2026},
+  author={Galadini, Giuliano and Uncini, Aurelio and Comminiello, Danilo},
+  booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
   year={2026}
 }
-```
+``` 
